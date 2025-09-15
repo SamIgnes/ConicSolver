@@ -1,0 +1,482 @@
+using LinearAlgebra
+using SparseArrays
+using Plots
+
+
+mutable struct INEQ
+    Ind_NonNeg:: Vector{Int}  # Indici delle variabili con vincoli di non negatività
+    Ind_Box:: Vector{Int}  # Indici delle variabili con vincoli box (min, max)
+    rhs_BoxMin:: Vector{Float64}  # Valori t per i vincoli box Min
+    rhs_BoxMax:: Vector{Float64}  # Valori t per i vincoli box Max
+    Ind_InGen:: Vector{Vector{Int}}  # Indici delle variabili con vincoli generali 
+    Coeff_InGen:: Vector{Vector{Float64}}  # Coefficienti per i vincoli generali
+    rhs_inGen:: Vector{Float64}  # Valori t per i vincoli generali  
+end
+
+"""
+    struct SOC
+
+Represents a collection of Second-Order Cones (SOC).  
+
+Each cone is defined by:  
+- A set of indices corresponding to the variables inside the norm.  
+- A single index corresponding to the `t` variable (the scalar part of the cone).  
+"""
+
+struct SOC
+    Ind_Soc::Vector{Vector{Int}}  # Indices of the variables in the norm for each SOC
+    Ind_t_Soc::Vector{Int}        # Indices of the corresponding t variables (one per SOC)
+end
+
+
+"""
+    struct RSOC
+
+Represents a collection of Rotated Second-Order Cones (RSOC).  
+
+Each RSOC is defined by:
+- `Ind_x`: indices of the vector variables x in the quadratic part.
+- `Ind_u`: index of the scalar variable u (must be non-negative).
+- `Ind_v`: index of the scalar variable v (must be non-negative).
+
+The RSOC constraint is: `||x||^2 <= 2 * u * v`, with `u >= 0` and `v >= 0`.
+"""
+struct RSOC
+    Ind_x::Vector{Vector{Int}}  # Indices of x variables for each RSOC
+    Ind_u::Vector{Int}          # Indices of u variables
+    Ind_v::Vector{Int}          # Indices of v variables
+end
+
+
+struct SOCP
+    c::Vector{Float64}  # cost vector
+    A::Matrix{Float64}  # equality constraint matrix
+    b::Vector{Float64}  # equality constraint rhs
+    Soc :: SOC   # per SOC
+    Rsoc :: RSOC # per RSOC
+    Ineq :: INEQ         # Inequality constraints 
+end
+
+# Proiezione sul cono di Lorentz (lasciamo questa per compatibilità interna)
+function proj_lorentz(u::AbstractVector, t::Real)
+    nx = norm(u)
+    if nx <= t
+        return copy(u), t
+    elseif nx <= -t
+        return zeros(eltype(u), length(u)), 0.0
+    else
+        # caso generico
+        alpha = (nx + t) / (2nx)
+        return alpha * u, (nx + t) / 2
+    end
+end
+
+# Proiezione sul set { (u,t) : ||u|| <= t, Tmin <= t <= Tmax }
+function proj_soc_with_tbox(u0::AbstractVector, t0::Real, Tmin::Real, Tmax::Real)
+    nx = norm(u0)
+
+    # proiezione sul cono "libero"
+    u_s, t_s = proj_lorentz(u0, t0)
+
+    # se il t proiettato cade nei bounds, siamo a posto
+    if Tmin <= t_s <= Tmax
+        return u_s, t_s
+    end
+
+    # altrimenti il vincolo su t è attivo: fissiamo t a un estremo e proiettiamo u sulla palla di raggio t
+    if t_s > Tmax
+        t_proj = Tmax
+        if nx <= Tmax || nx == 0.0
+            u_proj = copy(u0)    # già nella palla di raggio Tmax
+        else
+            u_proj = (Tmax / nx) * u0
+        end
+        return u_proj, t_proj
+    else # t_s < Tmin
+        t_proj = Tmin
+        if nx <= Tmin || nx == 0.0
+            u_proj = copy(u0)
+        else
+            u_proj = (Tmin / nx) * u0
+        end
+        return u_proj, t_proj
+    end
+end
+
+# Proiezione sul Rotated Second-Order Cone
+function proj_rsoc(u::Float64, v::Float64, w::Vector{Float64})
+    # Step 1: trasformazione in coordinate SOC standard
+    t = 0.5 * (u + v)
+    s = [0.5 * (u - v); w ./ sqrt(2)]   # concat scalare e vettore
+    
+    # Step 2: proiezione sul SOC standard
+    t_proj, s_proj = proj_lorentz(t, s)
+    
+    # Step 3: trasformazione inversa
+    x = t_proj + s_proj[1]
+    y = t_proj - s_proj[1]
+    z = sqrt(2) .* s_proj[2:end]
+    
+    return (x, y, z)
+end
+
+function projSOCP(v, Soc, Rsoc, Ineq)
+    
+    z = copy(v)
+
+    # Proiezione su ogni cono SOC
+    for (idx, t_idx) in zip(Soc.Ind_Soc, Soc.Ind_t_Soc)
+        ui = v[idx]       # vettore di controllo
+        ti = v[t_idx]     # scalare t
+        uproj, tproj = proj_lorentz(ui, ti)
+        z[vcat(idx, t_idx)] = vcat(uproj, tproj)
+    end
+
+
+    # # Proiezione su ogni cono SOC con rispetto del box su t (intersezione)
+    # for idx in Soc.Ind_Soc and t_idx in Soc.Ind_t_Soc
+    #     ui = v[idx]   # vettore controllo
+    #     ti = v[t_idx]       # scalare t
+    #     uproj, tproj = proj_soc_with_tbox(ui, ti)
+    #     z[idx] = vcat(uproj, tproj)
+    # end
+
+
+    # (opzionale) Proiezione su vincoli di non negatività per altri indici scalar
+    # Se nonneg_idx contiene indici scalari: applica clamp inferiore a 0
+    for ii in Ineq.Ind_NonNeg
+        z[ii] = min(z[ii], 0.0)
+    end
+
+
+    # Se hai altri box scalari (diversi dai t già gestiti), li clamp qui
+    for (ii, idx) in zip(Ineq.Ind_Box, 1:length(Ineq.Ind_Box))
+        z[ii] = clamp(z[ii], Ineq.rhs_BoxMin[idx] , Ineq.rhs_BoxMax[idx])
+    end
+
+    return z
+end
+
+
+
+# ------------------------------------------------------------------------------
+# ADMM solver
+# ------------------------------------------------------------------------------
+
+function admm_socp(prob::SOCP; ρ=1.0, max_iter=10000,rtol=1e-4, atol=1e-4, verbose=true)
+    """
+     admm_socp(prob::SOCP; ρ = 1.0, max_iter = 10_000,
+       rtol = 1e-4, atol = 1e-4, verbose = true)
+        Solves `prob` with ADMM and returns `(x, history)`.
+        `history` is a Dict with primal/dual residual norms for plotting / inspection.
+    """
+
+
+    # unpack problem
+    c, A, b, Soc, Rsoc, Ineq  = prob.c, prob.A, prob.b, prob.Soc, prob.Rsoc, prob.Ineq
+
+    nIneq_Gen = length(Ineq.rhs_inGen)
+
+    if nIneq_Gen > 0
+        # Aggiungi i vincoli di ineguaglianza generali alla matrice A
+        A_ineq = zeros(nIneq_Gen, length(c) + nIneq_Gen)
+        for i in 1:nIneq_Gen
+            A_ineq[i, Ineq.Ind_InGen[i]] = Ineq.Coeff_InGen[i]
+            A_ineq[i, length(c) + i] = 1.0  # variabile slack
+            Ineq.Ind_NonNeg = vcat(Ineq.Ind_NonNeg, length(c) + i)  # aggiungi variabile slack ai non-negativi
+        end
+
+        A = hcat(A, zeros(size(A, 1), size(A_ineq, 2) - size(A, 2)))
+        A = vcat(A, A_ineq)
+        b = vcat(b, Ineq.rhs_inGen)
+        # Espandi il vettore dei costi c per le nuove variabili slack
+        c = vcat(c, zeros(nIneq_Gen))
+
+    end
+
+    n = length(c)
+    m = size(A, 1)
+
+    # precompute KKT factorisation for the x‑subproblem
+    K = [ρ*Matrix{Float64}(I, n, n)  A'; 
+         A                          zeros(m, m)]
+    F = lu(K)      # factor once
+
+    # initialise variables
+    x = zeros(n);  z = copy(x);  u = zeros(n)
+
+    # iteration history
+    hist = Dict(:r_norm=>Float64[], :s_norm=>Float64[])
+
+    for k in 1:max_iter
+        # ----- 1. x‑update (quadratic + equality) -----------------------------
+        rhs = vcat(ρ*(z - u) - c, b)
+        sol = F \ rhs
+        x   = sol[1:n]
+
+        # ----- 2. z‑update (projection onto K) -------------------------------
+        v = x + u
+        z_old = copy(z) 
+        z = projSOCP(v, Soc, Rsoc, Ineq)
+
+        # ----- 3. dual update -----------------------------------------------
+        u += x - z
+
+        # ----- diagnostics ---------------------------------------------------
+        r_norm = norm(x - z)                  # primal residual
+        s_norm = ρ * norm(z - z_old)      # dual residual (simplifies)
+        push!(hist[:r_norm], r_norm)
+        push!(hist[:s_norm], s_norm)
+
+        eps_pri = sqrt(n)*atol + rtol*max(norm(x), norm(z))
+        eps_du  = sqrt(n)*atol + rtol*norm(ρ*u)
+
+
+        if verbose && k % 100 == 0
+            @info "iter $k  r = $(round(r_norm, sigdigits=3))  " *
+                  "s = $(round(s_norm, sigdigits=3))"
+        end
+        if r_norm ≤ eps_pri && s_norm ≤ eps_du
+            verbose && @info "Converged in $k iterations"
+            return x, hist
+        end
+    end
+    @warn "ADMM reached max_iter = $max_iter without convergence"
+    return z, hist
+end
+
+function demo()
+
+# ------------------------------------------------------
+# Parametri Marte e navetta
+# ------------------------------------------------------
+N = 72
+dt = 1
+Isp = 225
+g  = [0.0, 0.0, -3.711]     # m/s^2 (Marte) come vettore
+φ = 27*(π/180)  # angolo di inclinazione del motore
+alpha  = 1/(Isp*9.80665*cos(φ)) # calcola in base ai tuoi parametri
+T = 6 * 3.1e3
+ρ1 = 0.3*T
+ρ2 = 0.8*T
+m_wet   = 1905.0
+β     = tand(1)
+r0 = [2000, 0.0, 1500] # posizione iniziale (m)
+v0 = [100.0, 0.0, -75.0]      # velocità iniziale (m/s)
+z0_init = log(m_wet)
+
+# Precompute z0_k, μ1_k, μ2_k
+z0k  = [log(m_wet - alpha*ρ2*(k*dt)) for k in 0:N]
+μ1k  = [ρ1*exp(-z0k[k+1]) for k in 0:N]
+μ2k  = [ρ2*exp(-z0k[k+1]) for k in 0:N]
+zmax = [log(m_wet - alpha*ρ1*(k*dt)) for k in 0:N]
+
+
+n_state = 7   # r(3), v(3), m(1)
+n_ctrl = 3    # u (3D)
+n_t = 1       # t SOC per ogni passo
+n_var_per_step = n_state + n_ctrl + n_t
+
+total_vars = (N+1) * n_var_per_step 
+
+# ------------------------------------------------------
+# Costruire A e b such that A*x = b
+# ------------------------------------------------------
+A = zeros(7*(N+2)-1, total_vars)  # dimensione placeholder
+b = zeros(size(A,1))
+row_idx = 1
+
+for k in 1 : (N)
+    base_k = (k-1)*n_var_per_step
+    base_k1 = k*n_var_per_step
+
+    # Posizione
+    for i in 1:3
+        A[row_idx, base_k+i] = 1.0
+        A[row_idx, base_k1+i] = -1.0
+        A[row_idx, base_k+3+i] = dt/2
+        A[row_idx, base_k1+3+i] = dt/2
+        A[row_idx, base_k+7+i] =  1/12*dt^2  # linearizzazione con m_k
+        A[row_idx, base_k1+7+i] = -1/12*dt^2  # linearizzazione con m_k
+        b[row_idx] = 0.0
+        row_idx += 1
+    end
+
+    # Velocità
+    for i in 1:3
+        A[row_idx, base_k+3+i] = 1.0
+        A[row_idx, base_k1+3+i] = -1.0
+        A[row_idx, base_k+7+i] = +dt/2   # linearizzazione
+        A[row_idx, base_k1+7+i] = +dt/2   # linearizzazione
+        b[row_idx] = dt * g[i]
+        row_idx += 1
+    end
+
+    # Massa m_{k+1} = m_k - dt*alpha*t_k
+    A[row_idx, base_k1+7] = -1.0
+    A[row_idx, base_k+7] = +1.0
+    A[row_idx, base_k+n_state+n_ctrl+1] = -dt *alpha/2
+    A[row_idx, base_k1+n_state+n_ctrl+1] = -dt*alpha/2
+    b[row_idx] = 0.0
+    row_idx += 1
+end
+
+# Vincoli iniziali r0, v0, m0
+for i in 1:3
+    A[row_idx, i] = 1.0; b[row_idx] = r0[i]; row_idx += 1
+end
+for i in 1:3
+    A[row_idx, 3+i] = 1.0; b[row_idx] = v0[i]; row_idx += 1
+end
+A[row_idx,7] = 1.0; b[row_idx] = z0_init; row_idx += 1
+
+# Vincoli finali rN=0, vN=0
+
+base_N = (N)*n_var_per_step
+for i in 1:3
+    A[row_idx, base_N + i] = 1.0; b[row_idx] = 0.0; row_idx += 1
+end
+for i in 1:3
+    A[row_idx, base_N + 3 + i] = 1.0; b[row_idx] = 0.0; row_idx += 1
+end
+# A[row_idx, base_N + 7 ] = 1.0; b[row_idx] = 1505; row_idx += 1
+
+
+# ------------------------------------------------------
+# Blocchi SOC
+# ------------------------------------------------------
+Soc = SOC( [collect(base+8:base+10) for base in 0:n_var_per_step:(N-1)*n_var_per_step],
+            [base + n_state + n_ctrl + 1 for base in 0:n_var_per_step:(N-1)*n_var_per_step] )
+
+# ------------------------------------------------------
+# Blocchi RSOC
+# ------------------------------------------------------
+# RSOC_idx = []
+# for k in 1:N
+#     base = (k-1)*n_var_per_step
+#     u_indices = base+8:base+10
+#     t_index = base+11
+#     push!(RSOC_idx, vcat(u_indices, t_index))
+# end
+
+# nonneg_idx = [base+11 for base in 0:n_var_per_step:(N-1)*n_var_per_step]
+# nonneg_idx = vcat(nonneg_idx)  # includi anche massa finale mN >= m_min
+
+Rsoc = RSOC([], [], [])
+
+# ------------------------------------------------------
+# Vincoli di Inequality 
+# ------------------------------------------------------
+rhs_BoxMin_t = Float64[]
+rhs_BoxMax_t = Float64[]
+Ind_Box_t    = Int[]
+
+rhs_BoxMin_z = Float64[]
+rhs_BoxMax_z = Float64[]
+Ind_Box_z    = Int[]
+
+Ind_InGen = Vector{Vector{Int}}()
+Coeff_InGen = Vector{Vector{Float64}}()
+rhs_inGen = Float64[]
+
+for k in 1:N+1
+    base_k = (k-1)*n_var_per_step
+    
+    z_index = base_k + 7   # variabile log-massa
+    t_index = base_k + n_state + n_ctrl + 1   # variabile t
+    
+    z0k = log(m_wet - alpha*ρ2*(k*dt))
+    μ1k = ρ1*exp(-z0k)
+    μ2k = ρ2*exp(-z0k)
+
+    push!(Ind_InGen,[t_index, z_index])
+    push!(Coeff_InGen, [1, μ2k])
+    push!(rhs_inGen, μ2k*(1 - z0k))  # upper bound dinamico per t_k
+    
+    
+    # bounds per z_k
+    push!(rhs_BoxMin_z, z0k)
+    push!(rhs_BoxMax_z, log(m_wet - alpha*ρ1*(k*dt)))
+    push!(Ind_Box_z, z_index)
+end
+
+Ineq = INEQ([],Ind_Box_z,
+              rhs_BoxMin_z,
+              rhs_BoxMax_z,
+              Ind_InGen , Coeff_InGen, rhs_inGen)
+
+# Ineq = INEQ([], [],
+#              [],
+#              [],
+#              [], [])
+
+# ------------------------------------------------------
+# Cost vector
+# ------------------------------------------------------
+c = zeros(total_vars)
+c[ (N-1) *n_var_per_step + 7] = -1
+
+
+
+# Definizione problema
+prob = SOCP(c, A, b, Soc, Rsoc, Ineq)
+
+# Risolvi con ADMM
+x, hist = admm_socp(prob; ρ=1, max_iter=10000, rtol=1e-4, atol=1e-3, verbose=false)
+
+
+# ------------------------------------------------------
+# Estrarre traiettoria
+# ------------------------------------------------------
+r_traj = [x[(k-1)*n_var_per_step+1 : (k-1)*n_var_per_step+3] for k in 1:N]
+v_traj = [x[(k-1)*n_var_per_step+4 : (k-1)*n_var_per_step+6] for k in 1:N]
+z_traj = [x[(k-1)*n_var_per_step+7] for k in 1:N]
+u_traj = [x[(k-1)*n_var_per_step+8 : (k-1)*n_var_per_step+10] for k in 1:N]
+theta_traj = [acosd(x[(k-1)*n_var_per_step+8] / norm(u_traj[k])) for k in 1:N]
+t_traj = [x[(k-1)*n_var_per_step+11] for k in 1:N]
+
+
+
+println("Objective (fuel) = ", m_wet - exp.(z_traj[end]))
+# println("r_traj = ", r_traj)
+# println("v_traj = ", v_traj)
+# println("m_traj = ", m_traj)
+
+# Convertire lista di vettori in matrice N x 3
+r_mat = hcat(r_traj...)'  # N x 3
+v_mat = hcat(v_traj...)'  # N x 3
+u_mat = hcat(u_traj...)'  # N x 3
+theta_vec = collect(theta_traj) # già N x 1 
+m_vec = exp.(collect(z_traj))   # già N x 1
+
+# Posizione
+display(plot(r_mat, label=["x" "y" "z"], title="Position Trajectory",
+     xlabel="Time step", ylabel="Position (m)"))
+
+display(plot(v_mat, label=["vx" "vy" "vz"], title="Velocity Trajectory",
+     xlabel="Time step", ylabel="Velocity (m/s)"))
+
+display(plot(m_vec, label="Mass", title="Mass Trajectory",
+     xlabel="Time step", ylabel="Mass (kg)"))
+
+display(plot(m_vec.*t_traj./T, label="Thrust Fraction", title="Thrust Fraction Trajectory",
+xlabel="Time step", ylabel="Thrust Fraction of Max"))
+
+display(plot(u_mat, label=["ux" "uy" "uz"], title="Acceleration Trajectory",
+     xlabel="Time step", ylabel="Acceleration (m/s^2)"))
+
+t_vec = [ x[(k-1)*n_var_per_step + n_state + n_ctrl + 1] for k in 1:N ]
+u_norm = [ norm(x[(k-1)*n_var_per_step + 8 : (k-1)*n_var_per_step + 10]) for k in 1:N ]
+
+display(plot(theta_vec, label="Thrust direction", title="Thrust direction angle",
+xlabel="Time step", ylabel="Thrust direction (degrees)"))
+
+display(plot(hcat(t_vec,u_norm), label=["t" "||u||"], title="t plot",
+xlabel="Time step", ylabel="Acceleration Magnitude (m/s^2)"))
+
+end
+
+
+
+
+demo()

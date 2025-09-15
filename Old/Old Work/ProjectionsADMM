@@ -1,0 +1,94 @@
+# ProjectionsADMM.jl
+
+
+# Proiezione sul cono di Lorentz (lasciamo questa per compatibilità interna)
+function proj_lorentz(u::AbstractVector, t::Real)
+    nx = norm(u)
+    if nx <= t
+        return copy(u), t
+    elseif nx <= -t
+        return zeros(eltype(u), length(u)), 0.0
+    else
+        # caso generico
+        alpha = (nx + t) / (2nx)
+        return alpha * u, (nx + t) / 2
+    end
+end
+
+# Proiezione sul set { (u,t) : ||u|| <= t, Tmin <= t <= Tmax }
+function proj_soc_with_tbox(u0::AbstractVector, t0::Real, Tmin::Real, Tmax::Real)
+    nx = norm(u0)
+
+    # proiezione sul cono "libero"
+    u_s, t_s = proj_lorentz(u0, t0)
+
+    # se il t proiettato cade nei bounds, siamo a posto
+    if Tmin <= t_s <= Tmax
+        return u_s, t_s
+    end
+
+    # altrimenti il vincolo su t è attivo: fissiamo t a un estremo e proiettiamo u sulla palla di raggio t
+    if t_s > Tmax
+        t_proj = Tmax
+        if nx <= Tmax || nx == 0.0
+            u_proj = copy(u0)    # già nella palla di raggio Tmax
+        else
+            u_proj = (Tmax / nx) * u0
+        end
+        return u_proj, t_proj
+    else # t_s < Tmin
+        t_proj = Tmin
+        if nx <= Tmin || nx == 0.0
+            u_proj = copy(u0)
+        else
+            u_proj = (Tmin / nx) * u0
+        end
+        return u_proj, t_proj
+    end
+end
+
+# Proiezione sul Rotated Second-Order Cone
+function proj_rsoc(u::Float64, v::Float64, w::Vector{Float64})
+    # Step 1: trasformazione in coordinate SOC standard
+    t = 0.5 * (u + v)
+    s = [0.5 * (u - v); w ./ sqrt(2)]   # concat scalare e vettore
+    
+    # Step 2: proiezione sul SOC standard
+    t_proj, s_proj = proj_lorentz(t, s)
+    
+    # Step 3: trasformazione inversa
+    x = t_proj + s_proj[1]
+    y = t_proj - s_proj[1]
+    z = sqrt(2) .* s_proj[2:end]
+    
+    return (x, y, z)
+end
+
+function projSOCP(v, Soc, Rsoc, Ineq)
+    
+    z = copy(v)
+
+    # Proiezione su ogni cono SOC con rispetto del box su t (intersezione)
+    for idx in cone_idx
+        ui = v[idx[1:end-1]]   # vettore controllo
+        ti = v[idx[end]]       # scalare t
+        uproj, tproj = proj_soc_with_tbox(ui, ti, params.Tmin, params.Tmax)
+        z[idx] = vcat(uproj, tproj)
+    end
+
+    # (opzionale) Proiezione su vincoli di non negatività per altri indici scalar
+    # Se nonneg_idx contiene indici scalari: applica clamp inferiore a 0
+    for ii in nonneg_idx
+        z[ii] = max(z[ii], 0.0)
+    end
+
+    # Se hai altri box scalari (diversi dai t già gestiti), li clamp qui
+    for ii in box_idx
+        # assicurati che box_idx non contenga gli stessi indici già usati nei cone_idx,
+        # altrimenti è ridondante (i t vengono già clamped dentro proj_soc_with_tbox).
+        z[ii] = clamp(z[ii],params.m_min , params.m_max)
+    end
+
+    return z
+end
+

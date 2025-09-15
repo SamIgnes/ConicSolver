@@ -1,0 +1,277 @@
+using LinearAlgebra
+using SparseArrays
+using Plots
+
+
+mutable struct INEQ
+    Ind_NonNeg:: Vector{Int}  # Indici delle variabili con vincoli di non negatività
+    Ind_Box:: Vector{Int}  # Indici delle variabili con vincoli box (min, max)
+    rhs_BoxMin:: Vector{Float64}  # Valori t per i vincoli box Min
+    rhs_BoxMax:: Vector{Float64}  # Valori t per i vincoli box Max
+    Ind_InGen:: Vector{Vector{Int}}  # Indici delle variabili con vincoli generali 
+    Coeff_InGen:: Vector{Vector{Float64}}  # Coefficienti per i vincoli generali
+    rhs_inGen:: Vector{Float64}  # Valori t per i vincoli generali  
+end
+
+"""
+    struct SOC
+
+Represents a collection of Second-Order Cones (SOC).  
+
+Each cone is defined by:  
+- A set of indices corresponding to the variables inside the norm.  
+- A single index corresponding to the `t` variable (the scalar part of the cone).  
+"""
+
+struct SOC
+    Ind_Soc::Vector{Vector{Int}}  # Indices of the variables in the norm for each SOC
+    Ind_t_Soc::Vector{Int}        # Indices of the corresponding t variables (one per SOC)
+end
+
+
+"""
+    struct RSOC
+
+Represents a collection of Rotated Second-Order Cones (RSOC).  
+
+Each RSOC is defined by:
+- `Ind_x`: indices of the vector variables x in the quadratic part.
+- `Ind_u`: index of the scalar variable u (must be non-negative).
+- `Ind_v`: index of the scalar variable v (must be non-negative).
+
+The RSOC constraint is: `||x||^2 <= 2 * u * v`, with `u >= 0` and `v >= 0`.
+"""
+struct RSOC
+    Ind_x::Vector{Vector{Int}}  # Indices of x variables for each RSOC
+    Shift_x::Vector{Float64}   # Shift values for x variables (if any)
+    Ind_u::Vector{Int}          # Indices of u variables
+    Ind_v::Vector{Int}          # Indices of v variables
+    v::Vector{Float64}          # Optional: values for v (if fixed)
+end
+
+
+struct SOCP
+    c::Vector{Float64}  # cost vector
+    A::Matrix{Float64}  # equality constraint matrix
+    b::Vector{Float64}  # equality constraint rhs
+    Soc :: SOC   # per SOC
+    Rsoc :: RSOC # per RSOC
+    Ineq :: INEQ         # Inequality constraints 
+end
+
+# Proiezione sul cono di Lorentz (lasciamo questa per compatibilità interna)
+function proj_lorentz(u::AbstractVector, t::Real)
+    nx = norm(u)
+    if nx <= t
+        return copy(u), t
+    elseif nx <= -t
+        return zeros(eltype(u), length(u)), 0.0
+    else
+        # caso generico
+        alpha = (nx + t) / (2nx)
+        return alpha * u, (nx + t) / 2
+    end
+end
+
+# # Proiezione sul set { (u,t) : ||u|| <= t, Tmin <= t <= Tmax }
+# function proj_soc_with_tbox(u0::AbstractVector, t0::Real, Tmin::Real, Tmax::Real)
+#     nx = norm(u0)
+
+#     # proiezione sul cono "libero"
+#     u_s, t_s = proj_lorentz(u0, t0)
+
+#     # se il t proiettato cade nei bounds, siamo a posto
+#     if Tmin <= t_s <= Tmax
+#         return u_s, t_s
+#     end
+
+#     # altrimenti il vincolo su t è attivo: fissiamo t a un estremo e proiettiamo u sulla palla di raggio t
+#     if t_s > Tmax
+#         t_proj = Tmax
+#         if nx <= Tmax || nx == 0.0
+#             u_proj = copy(u0)    # già nella palla di raggio Tmax
+#         else
+#             u_proj = (Tmax / nx) * u0
+#         end
+#         return u_proj, t_proj
+#     else # t_s < Tmin
+#         t_proj = Tmin
+#         if nx <= Tmin || nx == 0.0
+#             u_proj = copy(u0)
+#         else
+#             u_proj = (Tmin / nx) * u0
+#         end
+#         return u_proj, t_proj
+#     end
+# end
+
+"""
+    proj_rsoc(u, v, w)
+
+Proietta il punto (u,v,w) sul Rotated Second-Order Cone:
+    R = { (u,v,w) : u >= 0, v >= 0, 2uv >= ||w||^2 }.
+
+Restituisce (u_proj, v_proj, w_proj).
+"""
+
+function proj_rsoc(u::Float64, v::Float64, w::Float64)
+    # Wrappa lo scalare in un vettore e richiama la versione generale
+    u_proj, v_proj, w_proj_vec = proj_rsoc(u, v, [w])
+    return u_proj, v_proj, w_proj_vec[1]
+end
+
+function proj_rsoc_fixed_v_analytic(u0::Float64, w0::Float64, v0::Float64)
+    @assert v0 > 0 "v0 must be > 0"
+
+    r0 = norm(w0)
+
+    # caso già ammissibile
+    if u0 >= (r0^2)/(2v0) && u0 >= 0.0
+        return u0, v0, copy(w0)
+    end
+
+    # caso r0 == 0 (w0 zero vector): si riduce a minimizzare rispetto a r>=0
+    if isapprox(r0, 0.0; atol=0) || r0 == 0.0
+        # la cubica riduce a r*(r^2/(2v0^2) + 1 - u0/v0) = 0
+        # soluzioni: r = 0 oppure r^2 = 2 v0^2 (u0/v0 - 1)
+        # ma abbiamo r>=0; comunque possiamo usare Cardano con r0=0:
+        # p, q con r0=0
+        p = 2v0^2 - 2v0*u0
+        q = 0.0
+        # cubica: r^3 + p*r + 0 = 0 -> r(r^2 + p) = 0
+        # r=0 always feasible; controlla se esistono radici reali positive:
+        if p < 0
+            r_star = sqrt(-p)
+        else
+            r_star = 0.0
+        end
+        # scegli r che minimizza (valuta oggetto)
+        candidates = [0.0]
+        if r_star > 0
+            push!(candidates, r_star)
+        end
+        best_r = candidates[argmin([0.5*((rr^2/(2v0)-u0)^2 + (rr - r0)^2) for rr in candidates])]
+        u_proj = best_r^2/(2v0)
+        w_proj = zeros(eltype(w0), length(w0))
+        return u_proj, v0, w_proj
+    end
+
+    # costanti per la cubica r^3 + p*r + q = 0
+    p = 2v0^2 - 2v0*u0
+    q = -2v0^2 * r0
+
+    # discriminante di Cardano
+    Δ = (q/2)^2 + (p/3)^3
+
+    if Δ >= 0.0
+        # una radice reale (Cardano reale)
+        A = cbrt(-q/2 + sqrt(Δ))
+        B = cbrt(-q/2 - sqrt(Δ))
+        r_star = A + B
+    else
+        # tre radici reali; usare la forma trigonometrica
+        rho = sqrt(-(p/3)^3)
+        phi = acos( clamp(-q/(2*rho), -1.0, 1.0) )
+        # tre radici:
+        r1 = 2 * sqrt(-p/3) * cos(phi/3)
+        r2 = 2 * sqrt(-p/3) * cos((phi + 2π)/3)
+        r3 = 2 * sqrt(-p/3) * cos((phi + 4π)/3)
+        # scegli la radice reale non-negativa che minimizza l'obiettivo
+        cand = filter(x -> x >= 0, [r1, r2, r3])
+        if isempty(cand)
+            # nessuna radice non-negativa => prendi 0
+            r_star = 0.0
+        else
+            obj(r) = 0.5*((r^2/(2v0)-u0)^2 + (r - r0)^2)
+            r_star = cand[argmin(map(obj, cand))]
+        end
+    end
+
+    # protezione numerica: garantire r_star >= 0
+    r_star = max(r_star, 0.0)
+
+    # costruisci proiezione
+    u_proj = r_star^2/(2v0)
+    if r0 > 0
+        w_proj = (r_star / r0) * w0
+    else
+        w_proj = zeros(eltype(w0), length(w0))
+    end
+
+    return u_proj, v0, w_proj
+end
+
+function proj_rsoc(u::Float64, v::Float64, w::Vector{Float64})
+    # Step 1: trasformazione in SOC
+    t = (u + v) / sqrt(2)
+    s = (u - v) / sqrt(2)
+    q = vcat([s], w)  # s concatenato con w
+
+    # Step 2: proiezione su SOC standard
+    nq = norm(q)
+    if nq <= t
+        t_proj = t
+        q_proj = q
+    elseif nq <= -t
+        t_proj = 0.0
+        q_proj = zeros(length(q))
+    else
+        α = (nq + t) / (2nq)
+        t_proj = (nq + t) / 2
+        q_proj = α * q
+    end
+
+    # Step 3: trasformazione inversa
+    s_proj = q_proj[1]
+    w_proj = q_proj[2:end]
+    u_proj = (t_proj + s_proj) / sqrt(2)
+    v_proj = (t_proj - s_proj) / sqrt(2)
+
+    return u_proj, v_proj, w_proj
+end
+
+function projSOCP(v, Soc, Rsoc, Ineq)
+    z = copy(v)
+
+    # Proiezione su ogni cono SOC
+    for (idx, t_idx) in zip(Soc.Ind_Soc, Soc.Ind_t_Soc)
+        ui = v[idx]       # vettore di controllo
+        ti = v[t_idx]     # scalare t
+        uproj, tproj = proj_lorentz(ui, ti)
+        z[vcat(idx, t_idx)] = vcat(uproj, tproj)
+    end
+
+
+    # # Proiezione su ogni cono SOC con rispetto del box su t (intersezione)
+    # for idx in Soc.Ind_Soc and t_idx in Soc.Ind_t_Soc
+    #     ui = v[idx]   # vettore controllo
+    #     ti = v[t_idx]       # scalare t
+    #     uproj, tproj = proj_soc_with_tbox(ui, ti)
+    #     z[idx] = vcat(uproj, tproj)
+    # end
+
+    # Proiezione su ogni cono RSOC
+    for (w_idx, u_idx, v_idx) in zip(Rsoc.Ind_x, Rsoc.Ind_u, 1:length(Rsoc.Ind_u))
+
+        w = v[w_idx[v_idx]]  - Rsoc.Shift_x[v_idx]    
+        u = v[u_idx]     
+        vR = v[v_idx]
+        u_proj, v_proj, w_proj = proj_rsoc_fixed_v_analytic(u, w, vR)
+        z[vcat(u_idx, w_idx[v_idx])] = vcat(u_proj, w_proj + Rsoc.Shift_x[v_idx])
+    end
+
+
+    # (opzionale) Proiezione su vincoli di non negatività per altri indici scalar
+    # Se nonneg_idx contiene indici scalari: applica clamp inferiore a 0
+    for ii in Ineq.Ind_NonNeg
+        z[ii] = max(z[ii], 0.0)
+    end
+
+
+    # Se hai altri box scalari (diversi dai t già gestiti), li clamp qui
+    for (ii, idx) in zip(Ineq.Ind_Box, 1:length(Ineq.Ind_Box))
+        z[ii] = clamp(z[ii], Ineq.rhs_BoxMin[idx] , Ineq.rhs_BoxMax[idx])
+    end
+
+    return z
+end

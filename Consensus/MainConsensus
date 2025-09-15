@@ -1,0 +1,260 @@
+include("FuncAndStruct")
+include("ADMM_Consensus")
+
+using TickTock
+
+function demo()
+# ------------------------------------------------------
+# Parametri Marte e navetta
+# ------------------------------------------------------
+N = 72
+dt = 1
+Isp = 225
+g  = [0.0, 0.0, -3.711]     # m/s^2 (Marte) come vettore
+φ = 27*(π/180)  # angolo di inclinazione del motore
+alpha  = 1/(Isp*9.80665*cos(φ)) # calcola in base ai tuoi parametri
+T = 6 * 3.1e3
+ρ1 = 0.3*T
+ρ2 = 0.8*T
+m_wet   = 1905.0
+β     = tand(1)
+r0 = [2000, 0.0, 1500] # posizione iniziale (m)
+v0 = [100.0, 0.0, -75.0]      # velocità iniziale (m/s)
+z0_init = log(m_wet)
+
+# Precompute z0_k, μ1_k, μ2_k
+z0k  = [log(m_wet - alpha*ρ2*(k*dt)) for k in 0:N]
+μ1k  = [ρ1*exp(-z0k[k+1]) for k in 0:N]
+μ2k  = [ρ2*exp(-z0k[k+1]) for k in 0:N]
+zmax = [log(m_wet - alpha*ρ1*(k*dt)) for k in 0:N]
+
+
+n_state = 7   # r(3), v(3), m(1)
+n_ctrl = 3    # u (3D)
+n_t = 1       # t SOC per ogni passo
+n_t_RSOC = 1  # t RSOC per ogni passo
+n_var_per_step = n_state + n_ctrl + n_t + n_t_RSOC
+
+total_vars = (N+1) * n_var_per_step 
+
+
+# ------------------------------------------------------
+# Costruire A e b such that A*x = b
+# ------------------------------------------------------
+A = zeros(7*(N+2)-1, total_vars)  # dimensione placeholder
+b = zeros(size(A,1))
+row_idx = 1
+
+for k in 1 : (N)
+    base_k = (k-1)*n_var_per_step
+    base_k1 = k*n_var_per_step
+
+    # Posizione
+    for i in 1:3
+        A[row_idx, base_k+i] = 1.0
+        A[row_idx, base_k1+i] = -1.0
+        A[row_idx, base_k+3+i] = dt/2
+        A[row_idx, base_k1+3+i] = dt/2
+        A[row_idx, base_k+7+i] =  1/12*dt^2  # linearizzazione con m_k
+        A[row_idx, base_k1+7+i] = -1/12*dt^2  # linearizzazione con m_k
+        b[row_idx] = 0.0
+        row_idx += 1
+    end
+
+    # Velocità
+    for i in 1:3
+        A[row_idx, base_k+3+i] = 1.0
+        A[row_idx, base_k1+3+i] = -1.0
+        A[row_idx, base_k+7+i] = +dt/2   # linearizzazione
+        A[row_idx, base_k1+7+i] = +dt/2   # linearizzazione
+        b[row_idx] =  -dt * g[i]
+        row_idx += 1    
+    end
+
+    # Massa m_{k+1} = m_k - dt*alpha*t_k
+    A[row_idx, base_k+7] = 1.0
+    A[row_idx, base_k1+7] = -1.0
+    A[row_idx, base_k+n_state+n_ctrl+1] = - dt * alpha/2
+    A[row_idx, base_k1+n_state+n_ctrl+1] = - dt * alpha/2
+    b[row_idx] = 0.0
+    row_idx += 1
+end
+
+# Vincoli iniziali r0, v0, m0
+for i in 1:3
+    A[row_idx, i] = 1.0; b[row_idx] = r0[i]; row_idx += 1
+end
+for i in 1:3
+    A[row_idx, 3+i] = 1.0; b[row_idx] = v0[i]; row_idx += 1
+end
+A[row_idx,7] = 1.0; b[row_idx] = z0_init; row_idx += 1
+
+# Vincoli finali rN=0, vN=0
+
+base_N = (N)*n_var_per_step
+
+for i in 1:3
+    A[row_idx, base_N + i] = 1.0; b[row_idx] = 0.0; row_idx += 1
+end
+for i in 1:3
+    A[row_idx, base_N + 3 + i] = 1.0; b[row_idx] = 0.0; row_idx += 1
+end
+# A[row_idx, base_N + 7 ] = 1.0; b[row_idx] = 1505; row_idx += 1
+
+
+# ------------------------------------------------------
+# Blocchi SOC
+# ------------------------------------------------------
+Soc = SOC( [collect(base+8:base+10) for base in 0:n_var_per_step:(N)*n_var_per_step],
+            [base + n_state + n_ctrl + 1 for base in 0:n_var_per_step:(N)*n_var_per_step] )
+           
+# ------------------------------------------------------
+# Blocchi RSOC
+# ------------------------------------------------------
+Ind_z = [[base+7 for base in 0:n_var_per_step:(N)*n_var_per_step]]
+ind_tRSOC = [base+n_state+n_ctrl+2 for base in 0:n_var_per_step:(N)*n_var_per_step]
+
+
+Rsoc = RSOC(Ind_z, z0k, ind_tRSOC, [], collect(1/2*ones(N+1)))
+
+
+# Rsoc = RSOC([[]], [], [], [], [])
+
+# ------------------------------------------------------
+# Vincoli di Inequality 
+# ------------------------------------------------------
+
+rhs_BoxMin_z = Float64[]
+rhs_BoxMax_z = Float64[]
+Ind_Box_z    = Int[]
+
+Ind_NonNeg = Int[]
+Ind_InGen = Vector{Vector{Int}}()
+Coeff_InGen = Vector{Vector{Float64}}()
+rhs_inGen = Float64[]
+
+for k in 1:N+1
+    base_k = (k-1)*n_var_per_step
+    
+    z_index = base_k + 7   # variabile log-massa
+    t_index = base_k + n_state + n_ctrl + 1   # variabile t
+    t_index_RSOC = base_k + n_state + n_ctrl + 2   # variabile t RSOC
+    
+    push!(Ind_NonNeg,t_index_RSOC)
+
+    push!(Ind_InGen,[t_index, z_index])
+    push!(Coeff_InGen, [1, only(μ2k[k])])
+    push!(rhs_inGen, only(μ2k[k])*(1 + only(z0k[k])))  # upper bound dinamico per t_k
+    
+
+    push!(Ind_InGen,[t_index, z_index ])
+    push!(Coeff_InGen, [-1, only(-μ1k[k])])
+
+    # push!(Ind_InGen,[t_index, z_index , t_index_RSOC])
+    # push!(Coeff_InGen, [-1, only(-μ1k[k]),  only(1/2*μ1k[k])])
+    push!(rhs_inGen, -only(μ1k[k])*(1 + only(z0k[k])))  # lower bound dinamico per t_k
+
+    
+    # bounds per z_k
+    push!(Ind_InGen, [z_index])
+    push!(Coeff_InGen, [-1])
+    push!(rhs_inGen, -only(z0k[k]))
+
+    # bounds per z_k
+    push!(Ind_InGen, [z_index])
+    push!(Coeff_InGen, [1])
+    push!(rhs_inGen, log(m_wet - alpha*ρ1*(k*dt)))
+end
+
+Ineq = INEQ(Ind_NonNeg, Ind_Box_z,
+              rhs_BoxMin_z,
+              rhs_BoxMax_z,
+              Ind_InGen , Coeff_InGen, rhs_inGen)
+
+# Ineq = INEQ([], [],
+#              [],
+#              [],
+#              [], [],[])
+
+# ------------------------------------------------------
+# Cost vector
+# ------------------------------------------------------
+c = zeros(total_vars)
+c[ (N-1) *n_var_per_step + 7] = -1
+
+
+
+# Definizione problema
+prob = SOCP(c, A, b, Soc, Rsoc, Ineq)
+
+tick()
+# Risolvi con ADMM
+x, hist = admm_socp(prob; ρ=10, max_iter=100000, rtol=1e-4, atol=1e-4, verbose=false)
+
+tock()
+
+# ------------------------------------------------------
+# Estrarre traiettoria
+# ------------------------------------------------------
+r_traj = [x[(k-1)*n_var_per_step+1 : (k-1)*n_var_per_step+3] for k in 1:N]
+v_traj = [x[(k-1)*n_var_per_step+4 : (k-1)*n_var_per_step+6] for k in 1:N]
+z_traj = [x[(k-1)*n_var_per_step+7] for k in 1:N]
+u_traj = [x[(k-1)*n_var_per_step+8 : (k-1)*n_var_per_step+10] for k in 1:N]
+theta_traj = [acosd(x[(k-1)*n_var_per_step+8] / norm(u_traj[k])) for k in 1:N]
+t_traj = [x[(k-1)*n_var_per_step+11] for k in 1:N]
+tq_traj = [x[(k-1)*n_var_per_step+12] for k in 1:N]
+slack = [ x[total_vars+1:end]]
+
+
+
+println("Objective (fuel) = ", m_wet - exp.(z_traj[end]))
+# println("r_traj = ", r_traj)
+# println("v_traj = ", v_traj)
+# println("m_traj = ", m_traj)
+
+# Convertire lista di vettori in matrice N x 3
+r_mat = hcat(r_traj...)'  # N x 3
+v_mat = hcat(v_traj...)'  # N x 3
+u_mat = hcat(u_traj...)'  # N x 3
+theta_vec = collect(theta_traj) # già N x 1 
+m_vec = exp.(collect(z_traj))   # già N x 1
+
+# Posizione
+display(plot(r_mat, label=["x" "y" "z"], title="Position Trajectory",
+     xlabel="Time step", ylabel="Position (m)"))
+
+display(plot(v_mat, label=["vx" "vy" "vz"], title="Velocity Trajectory",
+     xlabel="Time step", ylabel="Velocity (m/s)"))
+
+display(plot(m_vec, label="Mass", title="Mass Trajectory",
+     xlabel="Time step", ylabel="Mass (kg)"))
+
+display(plot(m_vec.*t_traj./T, label="Thrust Fraction", title="Thrust Fraction Trajectory",
+xlabel="Time step", ylabel="Thrust Fraction of Max"))
+
+display(m_vec.*t_traj./T)
+
+display(plot(u_mat, label=["ux" "uy" "uz"], title="Acceleration Trajectory",
+     xlabel="Time step", ylabel="Acceleration (m/s^2)"))
+
+t_vec = [ x[(k-1)*n_var_per_step + n_state + n_ctrl + 1] for k in 1:N ]
+u_norm = [ norm(x[(k-1)*n_var_per_step + 8 : (k-1)*n_var_per_step + 10]) for k in 1:N ]
+
+display(plot(theta_vec, label="Thrust direction", title="Thrust direction angle",
+xlabel="Time step", ylabel="Thrust direction (degrees)"))
+
+display(plot(hcat(t_vec,u_norm), label=["t" "||u||"], title="t plot",
+xlabel="Time step", ylabel="Acceleration Magnitude (m/s^2)"))
+ 
+display(plot(hcat(tq_traj,(z_traj .-z0k[2:end]).^2), label=["t" "(z-z0)^2"], title="t RSOC plot",
+xlabel="Time step", ylabel="t and (z-z0)^2"))
+
+display(plot(hcat(hist[:r_norm], hist[:s_norm]), label=["Primal Residual" "Dual Residual"], yscale=:log10, title="Residuals",
+xlabel="Iteration", ylabel="Residuals"))
+
+display(plot(slack, label="Slack Variables", title="Slack Variables"))
+end
+
+demo()
+
+

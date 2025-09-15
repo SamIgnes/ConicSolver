@@ -1,0 +1,97 @@
+using JuMP, ECOS, LinearAlgebra, Plots, TickTock
+using BenchmarkTools
+
+
+# =========================
+# Parametri problema
+# =========================
+T = 10.0
+N = 500                    # numero di intervalli (usa N più grande per maggiore precisione)
+dt = T / N
+
+# Indici: useremo k = 0..N mappati su 1..N+1 in JuMP
+# x[1] = x_0, x[N+1] = x_N
+# v[1] = v_0, v[N+1] = v_N
+# u[1..N] corrispondono a u_0..u_{N-1}
+# s[1..N] epigrafi tali che s_k >= u_k^2
+
+# Parametri opzionali
+use_u_box = true      # true per aggiungere vincolo -u_max <= u <= u_max
+u_max = 0.2
+
+# =========================
+# Costruzione modello JuMP + SCS
+# =========================
+
+model = Model(ECOS.Optimizer)
+
+set_optimizer_attribute(model, "verbose", 0)
+
+@variable(model, x[1:N+1])
+@variable(model, v[1:N+1])
+@variable(model, u[1:N])
+@variable(model, s[1:N] >= 0)   # s_k >= u_k^2 enforced via RSOC
+
+# Dinamica (Euler esplicito)
+for k in 1:N
+    @constraint(model, x[k+1] == x[k] + dt * v[k])
+    @constraint(model, v[k+1] == v[k] + dt * u[k])
+end
+
+# Condizioni iniziali e finali
+@constraint(model, x[1] == 0.0)      # x(0)=0
+@constraint(model, v[1] == 0.0)      # v(0)=0
+@constraint(model, x[N+1] == 5.0)    # x(T)=5
+@constraint(model, v[N+1] == 0.0)    # v(T)=0
+
+# RSOC per s_k >= u_k^2: (s_k, 1.0, u_k) in RotatedSecondOrderCone
+# In MathOptInterface notation: [s, 1.0, u] in MOI.RotatedSecondOrderCone()
+# JuMP espone MOI tramite il nome MOI:
+
+
+for k in 1:N
+    @constraint(model, [ s[k], 1.0, u[k] ] in RotatedSecondOrderCone())
+end
+
+# Opzione: vincolo box su u (se vuoi limitare il controllo e vedere bang-bang)
+if use_u_box
+    for k in 1:N
+        @constraint(model, -u_max <= u[k] <= u_max)
+    end
+end
+
+# Obiettivo: minimizza dt * sum(s_k) ≈ integral u^2 dt
+@objective(model, Min, dt * sum(s[k] for k in 1:N))
+
+# =========================
+# Risolvi
+# =========================
+
+
+@btime optimize!(model)
+
+
+status = termination_status(model)
+prstatus = primal_status(model)
+println("SCS termination: ", status, " ; primal status: ", prstatus)
+
+# Estrai soluzione
+x_sol = value.(x)
+v_sol = value.(v)
+u_sol = value.(u)
+s_sol = value.(s)
+objval = objective_value(model)
+
+println("Objective (approx integral u^2): ", objval)
+
+# =========================
+# Plot
+# =========================
+t = range(0, stop=T, length=N+1)          # tempi per x,v (N+1 punti)
+t_u = range(0, stop=T-dt, length=N)       # tempi per u (N punti)
+
+p1 = plot(t_u, u_sol, xlabel="Time [s]", ylabel="u", title="Control (u)", legend=false)
+p2 = plot(t, v_sol, xlabel="Time [s]", ylabel="v", title="Velocity (v)", legend=false)
+p3 = plot(t, x_sol, xlabel="Time [s]", ylabel="x", title="Position (x)", legend=false)
+
+plot(p1, p2, p3, layout=(3,1), size=(700,900))
