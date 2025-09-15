@@ -159,7 +159,7 @@ function admm_socp(x0, Soc::SOC, obj, H;
         if m>0
             for i in 1:m
                 idx_vec, idx_scal = Soc.Ind_Soc[i], Soc.Ind_t_Soc[i]
-                z[idx_vec,i], z[idx_scal,i] = proj_soc(x[idx_vec] + u[idx_vec,i], x[idx_scal])
+                z[idx_vec,i], z[idx_scal,i] = proj_soc(x[idx_vec] + u[idx_vec,i], x[idx_scal] + u[idx_scal])
 
             end
         end
@@ -180,7 +180,9 @@ function admm_socp(x0, Soc::SOC, obj, H;
         # --- u-update ---
         if m>0
             for i in 1:m
-                u[:,i] += x - z[:,i]
+                idx_vec, idx_scal = Soc.Ind_Soc[i], Soc.Ind_t_Soc[i]
+                u[idx_vec,i] += x[idx_vec,] - z[idx_vec,i]
+                u[idx_scal,i] += x[idx_scal,] - z[idx_scal,i]
             end
         end
         if A !== nothing && length(A)
@@ -355,7 +357,7 @@ function demo()
 
     # # ------------------------------------------------------
     # # Blocchi SOC
-    # # ------------------------------------------------------
+    # # # ------------------------------------------------------
     Soc = SOC( [collect(base+8:base+10) for base in 0:n_var_per_step:(N)*n_var_per_step],
                 [base + n_state + n_ctrl + 1 for base in 0:n_var_per_step:(N)*n_var_per_step])
 
@@ -480,8 +482,6 @@ function demo()
 
     # Plot
     t = 0 :dt:(N*dt)
-    display(r_mat)
-    display(t)
 
     p2 = plot(t[1:end],r_mat, xlabel="Time [s]", ylabel="Position x",  legend=false)
     p3 = plot(t[1:end],v_mat, xlabel="Time [s]", ylabel="veloity v",  legend=false)
@@ -491,7 +491,7 @@ function demo()
 
 
     display(plot( p2, p3, p4, layout=(3,1), size=(700,1000)))
-    plot( p5, layout=(3,1), size=(700,1000))
+    plot(p5)
 
 
 end

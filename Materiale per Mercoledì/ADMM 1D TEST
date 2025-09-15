@@ -1,0 +1,326 @@
+using LinearAlgebra
+using Plots
+using TickTock
+using BenchmarkTools
+using SparseArrays
+
+include("FunctionsProjections")
+
+
+# ================================================
+# ADMM SOCP con vincoli conici, Ax = g e Ax ≤ c
+# ================================================
+function admm_socp(x0, Soc:: SOC, obj, H; 
+                   F=nothing, g=nothing,    # vincoli lineari di uguaglianza
+                   A=nothing, c=nothing, Clamp,    # vincoli lineari di disuguaglianza
+                   ρ=1.0, max_iter=200, tol=1e-6)
+
+    n = length(x0)
+    m = length(Soc.Ind_Soc)
+    mv = length(Soc.Ind_t_Soc)
+    # ms = length(Soc.t_Soc)
+    nu = length(Clamp)
+
+    # Variabili primali
+    x = copy(x0)
+    z = m > 0 ? zeros(n, m) : zeros(0,0)
+    u = m > 0 ? zeros(n, m) : zeros(0,0)
+
+    # Variabili per disuguaglianze
+    if A !== nothing && length(A)
+        zA = zeros(n)
+        uA = zeros(n)
+    end
+
+    if nu > 0
+        zU = zeros(nu)
+        uU = zeros(nu)
+    end
+
+
+    # ============================
+    # Costruzione della matrice Hx per l'x-update
+    # ============================
+    Hx = copy(H)  # H è la matrice quadratica dell'obiettivo
+
+    # 1️⃣ Contributo dei vincoli conici
+    if m > 0
+        for i in 1:m
+            idx_vec = Soc.Ind_Soc[i]
+            # aggiungi rho su tutte le variabili coinvolte nel vincolo
+            Hx[idx_vec, idx_vec] +=  ρ * Matrix{Float64}(I, length(idx_vec), length(idx_vec))
+        end
+
+        if mv > 0
+            for i in 1:mv
+                idx_scal = Soc.Ind_t_Soc[i]
+                # aggiungi rho su tutte le variabili coinvolte nel vincolo
+                Hx[idx_scal, idx_scal] += ρ
+            end
+        end
+    else
+        sum_z_u = zeros(n)
+    end
+
+    # 2️⃣ Contributo dei vincoli lineari di disuguaglianza Ax <= c
+    if A !== nothing && length(A) > 0
+        for i in 1:n
+            Hx[i,i] += ρ   # aggiungi ρ solo alle variabili coinvolte in A
+        end
+    end
+
+    # 3️⃣ Contributo dei vincoli di clamp su u
+    if nu > 0
+        for i in Clamp
+            Hx[i,i] += ρ   # aggiungi ρ solo alle variabili di controllo u
+        end
+    end
+
+
+    Hx = Hx  # Hx quadraticausing SparseArrays
+
+    if F === nothing && size(F,1) == 0
+        Hx_fact = factorize(Hx)
+    else
+        KKT = [Hx F'; F zeros(size(F,1), size(F,1))]
+        KKT_fact = lu(KKT)
+    end
+
+
+    for k in 1:max_iter
+        # =========================================
+        # x-update completo per costo quadratico
+        # =========================================
+
+
+        # Contributo dei vincoli di disuguaglianza lineari
+        extra_term = zeros(n)
+       if A !== nothing && length(A) > 0
+            @views extra_term .+= zA - uA
+        end
+
+        if nu > 0
+            @views extra_term[n-nu+1:end] .+= zU - uU
+        end
+
+        if m > 0 
+            sum_z_u = zeros(n)
+            for j in 1:m
+                @views sum_z_u .+= z[:,j] .- u[:,j]
+            end
+        end
+
+
+        # Vettore right-hand side
+        f = ρ*sum_z_u + ρ*extra_term - obj
+
+        if F !== nothing && size(F,1) != 0
+            # Vincoli lineari di uguaglianza F x = g
+            # Risolvo sistema KKT:
+            # [Hx  F'; F 0] [x; λ] = [f; g]
+            rhs = vcat(f, g)
+            sol = KKT_fact \ rhs
+            x = sol[1:n]      # estraggo x
+        else
+            # Nessun vincolo lineare di uguaglianza
+            x = Hx_fact \ f
+        end
+
+        if any(isnan, x)
+            error("NaN rilevato")
+        end
+
+        # --- z-update (coni) ---
+        if m>0
+            for i in 1:m
+                idx_vec = Soc.Ind_Soc[i]
+                if i <= mv
+                    idx_scal = Soc.Ind_t_Soc[i]
+                    z[idx_vec,i], z[idx_scal,i] = proj_soc(x[idx_vec] + u[idx_vec,i], x[idx_scal] + u[idx_scal,i] )
+                else
+                    idx_scal = i - mv 
+                    # display(x[idx_vec] + u[idx_vec,i])
+                    z[idx_vec,i] = proj_soc(x[idx_vec] + u[idx_vec,i], Soc.t_Soc[idx_scal])
+                    # z[idx_vec,i] = clamp.(x[idx_vec] + u[idx_vec,i], - Soc.t_Soc[idx_scal], Soc.t_Soc[idx_scal])
+
+                end
+            end
+        end
+
+        # --- z-update (disuguaglianze Ax ≤ c) ---
+        if A !== nothing && length(A)
+            zA = proj_polytope!(x + uA, A, c)
+        end
+
+        # z-update per controllo con vincolo u_min <= u <= u_max
+
+        
+        if nu > 0
+            @views xU = x[Clamp] # estraggo u_k da x
+            zU .= clamp.(xU .+ uU, -0.2, 0.2)
+        end
+
+
+        # --- u-update ---
+        if m>0
+            for i in 1:m
+                idx_vec = Soc.Ind_Soc[i]
+                u[idx_vec,i] += x[idx_vec] - z[idx_vec,i]
+            end
+        end
+        if A !== nothing && length(A)
+            uA += x - zA
+        end
+
+        if nu > 0
+            uU += xU - zU
+        end
+
+        # --- Controllo convergenza ---
+        r_norm = 0.0
+        if m>0
+            r_norm += sum(norm.(eachcol(x .- z)))
+        end
+
+        if A !== nothing
+            r_norm += norm(x - zA)
+        end
+
+        if nu > 0
+            r_norm += norm(x[n-nu+1:end] - zU)
+        end
+
+        if r_norm < tol
+            println("Converged at iteration $k")
+            break
+        end
+    end
+
+
+    # ================================
+    # Check generale fattibilità
+    # ================================
+    feasible = true
+
+
+    # Vincoli conici
+    # for (c_, r_) in cones
+    #     dist = norm(x - c_)
+    #     if dist > r_ + tol
+    #         println("⚠️ Violato vincolo conico: distanza = $dist, raggio = $r_")
+    #         feasible = false
+    #     end
+    # end
+
+    # Vincoli lineari di uguaglianza
+    if F !== nothing && size(F,1) != 0
+        residual = norm(F * x - g)
+        if residual > tol
+            println("⚠️ Violati vincoli lineari di uguaglianza: residuo = $residual")
+            feasible = false
+        end
+    end
+
+    # Vincoli di disuguaglianza
+    if A !== nothing
+        viol = A * x - c
+        if any(viol .> tol)
+            println("⚠️ Violati vincoli di disuguaglianza: max violazione = $(maximum(viol))")
+            feasible = false
+        end
+    end
+
+    return x, z
+end
+
+
+
+# Parametri
+T = 10.0
+N = 50
+dt = T/N
+
+# Numero variabili stato
+nx = 2*(N+1)  # x_k, v_k
+nu = N        # u_k
+
+# Costruzione del problema lineare
+# Variabili concatenano: [x_0..x_N, v_0..v_N, u_0..u_{N-1}]
+n = nx + nu 
+
+# Obiettivo: J = sum(u_k^2)
+obj = zeros(n)
+obj[nx+1:end] .= 0.0  # minimizziamo u_k^2 → implementiamo in ADMM come obj^T x ~0, useremo proiezione dinamica
+
+# Vincoli dinamica Ax = g
+# Matrice di uguaglianza
+F = zeros(2*N+4, n)
+# F = zeros(2*N+5, n)
+
+for k in 1:N
+    # x_{k+1} - x_k - dt*v_k = 0
+    F[k, k] = -1
+    F[k, k+1] = 1
+    F[k, N+1+k] = -dt  # v_k
+
+    # v_{k+1} - v_k - dt*u_k = 0
+    F[N+k, N+1+k] = -1      # v_k
+    F[N+k, N+1+k+1] = 1          # v_{k+1}
+    F[N+k, nx+k] = -dt         # u_k
+end
+
+# Vincoli finali
+xT_idx = N+1
+vT_idx = 2*(N+1)
+F[2*N+1, xT_idx] = 1.0   # x_N = 5
+F[2*N+2, vT_idx] = 1.0   # v_N = 0
+
+xI_idx = 1
+vI_idx = N+2
+F[2*N+3, xI_idx] = 1.0   # x_N = 5
+F[2*N+4, vI_idx] = 1.0   # v_N = 0
+
+# F[2*N+5, n] = 1.0   # v_N = 0
+
+# g = vcat(zeros(2*N),[5.0, 0.0, 0.0, 0.0, 0.0])  # condizioni iniziali e finali
+g = vcat(zeros(2*N),[5.0, 0.0, 0.0, 0.0])  # condizioni iniziali e finali
+# In ADMM potremmo gestire condizioni finali come vincoli aggiuntivi
+# oppure aggiungere penalità quadratica nell'obiettivo
+
+# Punto iniziale
+x0 = zeros(n)
+
+# Nessun cono
+    Soc = SOC([collect([nx+k]) for k in 1:(nu)],
+    [], 0.25.*ones(nu)  )
+    # Soc = SOC([], [], [])
+
+# ADMM
+ρ = 1.0
+max_iter = 500
+tol = 1e-6
+
+# # Vincoli lineari Ax <= c
+A = []
+c = []
+
+
+H = zeros(n,n)
+H[nx+1:nx+nu, nx+1:nx+nu] = dt*I(N)   # peso integrale u_k^2
+
+
+x_sol, z_sol = admm_socp(x0, Soc, obj, H, F=F, g=g, Clamp = nx+1:nx+nu, ρ=ρ, max_iter=max_iter, tol=tol)
+
+
+x_vals = x_sol[1:N+1]  # posizioni x_k
+v_vals = x_sol[N+2:2*(N+1)]  # velocità v_k
+u_vals = x_sol[nx+1:nx+nu]  # forze u_k
+
+# Plot
+t = 0:dt:T
+
+p2 = plot(t[1:end], x_vals, xlabel="Time [s]", ylabel="Position x", title="Profilo della posizione ottima", legend=false)
+p3 = plot(t[1:end],v_vals, xlabel="Time [s]", ylabel="veloity v", title="Profilo della velocità ottima", legend=false)
+p4 = plot(t[2:end], u_vals, xlabel="Time [s]", ylabel="Force u", title="Profilo della forza ottima", legend=false)
+
+plot( p2, p3, p4, layout=(3,1), size=(700,1000))
