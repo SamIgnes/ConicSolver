@@ -1,0 +1,499 @@
+using LinearAlgebra
+using Plots
+using TickTock
+using BenchmarkTools
+using SparseArrays
+
+include("FunctionsProjections")
+
+
+
+mutable struct INEQ
+    Ind_NonNeg:: Vector{Int}  # Indici delle variabili con vincoli di non negatività
+    Ind_Box:: Vector{Int}  # Indici delle variabili con vincoli box (min, max)
+    rhs_BoxMin:: Vector{Float64}  # Valori t per i vincoli box Min
+    rhs_BoxMax:: Vector{Float64}  # Valori t per i vincoli box Max
+    Ind_InGen:: Vector{Vector{Int}}  # Indici delle variabili con vincoli generali 
+    Coeff_InGen:: Vector{Vector{Float64}}  # Coefficienti per i vincoli generali
+    rhs_inGen:: Vector{Float64}  # Valori t per i vincoli generali  
+end
+
+struct SOC
+    Ind_Soc::Vector{Vector{Int}}  # Indices of the variables in the norm for each SOC
+    Ind_t_Soc::Vector{Int}        # Indices of the corresponding t variables (one per SOC)
+end
+
+struct RSOC
+    Ind_x::Vector{Vector{Int}}  # Indices of x variables for each RSOC
+    Ind_u::Vector{Int}          # Indices of u variables
+    Ind_v::Vector{Int}          # Indices of v variables
+end
+
+
+struct SOCP
+    c::Vector{Float64}  # cost vector
+    A::Matrix{Float64}  # equality constraint matrix
+    b::Vector{Float64}  # equality constraint rhs
+    Soc :: SOC   # per SOC
+    Rsoc :: RSOC # per RSOC
+    Ineq :: INEQ         # Inequality constraints 
+end
+
+
+
+# ================================================
+# ADMM SOCP con vincoli conici, Ax = g e Ax ≤ c
+# ================================================
+function admm_socp(x0, Soc::SOC, obj, H; 
+                   F=nothing, g=nothing,    # vincoli lineari di uguaglianza
+                   A=nothing, c=nothing, Clamp,    # vincoli lineari di disuguaglianza
+                   ρ=1.0, max_iter=200, tol=1e-6)
+
+    n = length(x0)
+    m = length(Soc.Ind_t_Soc)  # numero di vincoli conici
+    nu = Clamp
+
+    # Variabili primali
+    x = copy(x0)
+    z = m > 0 ? zeros(n, m) : zeros(0,0)
+    u = m > 0 ? zeros(n, m) : zeros(0,0)
+
+
+    # Variabili per disuguaglianze
+    if A !== nothing && length(A)
+        zA = zeros(n)
+        uA = zeros(n)
+    end
+
+    if nu > 0
+        zU = zeros(nu)
+        uU = zeros(nu)
+    end
+
+
+    # ============================
+    # Costruzione della matrice Hx per l'x-update
+    # ============================
+    Hx = copy(H)  # H è la matrice quadratica dell'obiettivo
+
+    # 1️⃣ Contributo dei vincoli conici
+    if m > 0
+        for i in 1:m
+            idx_vec, idx_scal = Soc.Ind_Soc[i], Soc.Ind_t_Soc[i]
+            # aggiungi rho su tutte le variabili coinvolte nel vincolo
+            Hx[idx_vec, idx_vec] += ρ * Matrix{Float64}(I, length(idx_vec), length(idx_vec))
+            Hx[idx_scal, idx_scal] += ρ
+        end
+    else
+
+        sum_z_u = zeros(n)
+    end
+
+    # 2️⃣ Contributo dei vincoli lineari di disuguaglianza Ax <= c
+    if A !== nothing && length(A) > 0
+        for i in 1:n
+            Hx[i,i] += ρ   # aggiungi ρ solo alle variabili coinvolte in A
+        end
+    end
+
+    # 3️⃣ Contributo dei vincoli di clamp su u
+    if nu > 0
+        clamp_indices = (n - nu + 1):n  # indici delle variabili u
+        for i in clamp_indices
+            Hx[i,i] += ρ   # aggiungi ρ solo alle variabili di controllo u
+        end
+    end
+
+
+    # Hx = sparse(Hx)  # Hx quadraticausing SparseArrays
+
+    if F === nothing && size(F,1) == 0
+        Hx_fact = factorize(Hx)
+    else
+        # KKT = [Hx F'; F spzeros(size(F,1), size(F,1))]
+        KKT = [Hx F'; F zeros(size(F,1), size(F,1))]
+        KKT_fact = lu(KKT) ## LU per sparse factorize per altre 
+    end
+
+
+    for k in 1:max_iter
+        # =========================================
+        # x-update completo per costo quadratico
+        # =========================================
+
+
+        # Contributo dei vincoli di disuguaglianza lineari
+        extra_term = zeros(n)
+       if A !== nothing && length(A) > 0
+            @views extra_term .+= zA - uA
+        end
+        if nu > 0
+            @views extra_term[n-nu+1:end] .+= zU - uU
+        end
+
+
+        if m > 0 
+            sum_z_u = zeros(n)
+            for j in 1:m
+                @views sum_z_u .+= z[:,j] .- u[:,j]
+            end
+        end
+
+
+        # Vettore right-hand side
+        f = ρ*sum_z_u + ρ*extra_term - obj
+
+        if F !== nothing && size(F,1) != 0
+            # Vincoli lineari di uguaglianza F x = g
+            # Risolvo sistema KKT:
+            # [Hx  F'; F 0] [x; λ] = [f; g]
+            rhs = vcat(f, g)
+            sol = KKT_fact \ rhs
+            x = sol[1:n]      # estraggo x
+        else
+            # Nessun vincolo lineare di uguaglianza
+            x = Hx_fact \ f
+        end
+
+        # --- z-update (coni) ---
+        if m>0
+            for i in 1:m
+                idx_vec, idx_scal = Soc.Ind_Soc[i], Soc.Ind_t_Soc[i]
+                z[idx_vec,i], z[idx_scal,i] = proj_soc(x[idx_vec] + u[idx_vec,i], x[idx_scal])
+
+            end
+        end
+
+        # --- z-update (disuguaglianze Ax ≤ c) ---
+        if A !== nothing && length(A)
+            zA = proj_polytope!(x + uA, A, c)
+        end
+
+        # z-update per controllo con vincolo u_min <= u <= u_max
+
+        @views xU = x[(n - nu + 1):n] # estraggo u_k da x
+        if nu > 0
+            zU .= clamp.(xU .+ uU, -0.2, 0.2)
+        end
+
+
+        # --- u-update ---
+        if m>0
+            for i in 1:m
+                u[:,i] += x - z[:,i]
+            end
+        end
+        if A !== nothing && length(A)
+            uA += x - zA
+        end
+
+        if nu > 0
+            uU += xU - zU
+        end
+
+        # --- Controllo convergenza ---
+        r_norm = 0.0
+        if m>0
+            r_norm += sum(norm.(eachcol(x .- z)))
+        end
+
+        if A !== nothing
+            r_norm += norm(x - zA)
+        end
+
+        if nu > 0
+            r_norm += norm(x[n-nu+1:end] - zU)
+        end
+
+        if r_norm < tol
+            println("Converged at iteration $k")
+            break
+        end
+    end
+
+
+    # ================================
+    # Check generale fattibilità
+    # ================================
+    feasible = true
+
+
+    # Vincoli conici
+    # for (c_, r_) in cones
+    #     dist = norm(x - c_)
+    #     if dist > r_ + tol
+    #         println("⚠️ Violato vincolo conico: distanza = $dist, raggio = $r_")
+    #         feasible = false
+    #     end
+    # end
+
+    # Vincoli lineari di uguaglianza
+    if F !== nothing && size(F,1) != 0
+        residual = norm(F * x - g)
+        if residual > tol
+            println("⚠️ Violati vincoli lineari di uguaglianza: residuo = $residual")
+            feasible = false
+        end
+    end
+
+    # Vincoli di disuguaglianza
+    if A !== nothing
+        viol = A * x - c
+        if any(viol .> tol)
+            println("⚠️ Violati vincoli di disuguaglianza: max violazione = $(maximum(viol))")
+            feasible = false
+        end
+    end
+
+    return x, z
+end
+
+function demo()
+
+    # ADMM
+    ρ = 1.0
+    max_iter = 500
+    tol = 1e-6
+
+    # ------------------------------------------------------
+    # Parametri Marte e navetta
+    # ------------------------------------------------------
+    N = 72
+    dt = 1
+    Isp = 225
+    gM  = [0.0, 0.0, -3.711]     # m/s^2 (Marte) come vettore
+    φ = 27*(π/180)  # angolo di inclinazione del motore
+    alpha  = 1/(Isp*9.80665*cos(φ)) # calcola in base ai tuoi parametri
+    T = 6 * 3.1e3
+    ρ1 = 0.3*T
+    ρ2 = 0.8*T
+    m_wet   = 1905.0
+    β     = tand(1)
+    r0 = [2000, 0.0, 1500] # posizione iniziale (m)
+    v0 = [100.0, 0.0, -75.0]      # velocità iniziale (m/s)
+    z0_init = log(m_wet)
+
+    # Precompute z0_k, μ1_k, μ2_k
+    z0k  = [log(m_wet - alpha*ρ2*(k*dt)) for k in 0:N]
+    μ1k  = [ρ1*exp(-z0k[k+1]) for k in 0:N]
+    μ2k  = [ρ2*exp(-z0k[k+1]) for k in 0:N]
+    zmax = [log(m_wet - alpha*ρ1*(k*dt)) for k in 0:N]
+
+
+    n_state = 7   # r(3), v(3), m(1)
+    n_ctrl = 3    # u (3D)
+    n_t = 1       # t SOC per ogni passo
+    n_t_RSOC = 1  # t RSOC per ogni passo
+    n_var_per_step = n_state + n_ctrl + n_t + n_t_RSOC
+
+    total_vars = (N+1) * n_var_per_step 
+
+
+    # ------------------------------------------------------
+    # Costruire F e g such that F*x = g
+    # ------------------------------------------------------
+    F = zeros(7*(N+2)-1, total_vars)  # dimensione placeholder
+    g = zeros(size(F,1))
+    row_idx = 1
+
+    for k in 1 : (N)
+        base_k = (k-1)*n_var_per_step
+        base_k1 = k*n_var_per_step
+
+        # Posizione
+        for i in 1:3
+            F[row_idx, base_k+i] = 1.0
+            F[row_idx, base_k1+i] = -1.0
+            F[row_idx, base_k+3+i] = dt/2
+            F[row_idx, base_k1+3+i] = dt/2
+            F[row_idx, base_k+7+i] =  1/12*dt^2  # linearizzazione con m_k
+            F[row_idx, base_k1+7+i] = -1/12*dt^2  # linearizzazione con m_k
+            g[row_idx] = 0.0
+            row_idx += 1
+        end
+
+        # Velocità
+        for i in 1:3
+            F[row_idx, base_k+3+i] = 1.0
+            F[row_idx, base_k1+3+i] = -1.0
+            F[row_idx, base_k+7+i] = +dt/2   # linearizzazione
+            F[row_idx, base_k1+7+i] = +dt/2   # linearizzazione
+            g[row_idx] =  -dt * gM[i]
+            row_idx += 1    
+        end
+
+        # Massa m_{k+1} = m_k - dt*alpha*t_k
+        F[row_idx, base_k+7] = 1.0
+        F[row_idx, base_k1+7] = -1.0
+        F[row_idx, base_k+n_state+n_ctrl+1] = - dt * alpha/2
+        F[row_idx, base_k1+n_state+n_ctrl+1] = - dt * alpha/2
+        g[row_idx] = 0.0
+        row_idx += 1
+    end
+
+    # Vincoli iniziali r0, v0, m0
+    for i in 1:3
+        F[row_idx, i] = 1.0; g[row_idx] = r0[i]; row_idx += 1
+    end
+    for i in 1:3
+        F[row_idx, 3+i] = 1.0; g[row_idx] = v0[i]; row_idx += 1
+    end
+    F[row_idx,7] = 1.0; g[row_idx] = z0_init; row_idx += 1
+
+    # Vincoli finali rN=0, vN=0
+
+    base_N = (N)*n_var_per_step
+
+    for i in 1:3
+        F[row_idx, base_N + i] = 1.0; g[row_idx] = 0.0; row_idx += 1
+    end
+    for i in 1:3
+        F[row_idx, base_N + 3 + i] = 1.0; g[row_idx] = 0.0; row_idx += 1
+    end
+    # F[row_idx, base_N + 7 ] = 1.0; g[row_idx] = 1505; row_idx += 1
+
+
+    # # ------------------------------------------------------
+    # # Blocchi SOC
+    # # ------------------------------------------------------
+    Soc = SOC( [collect(base+8:base+10) for base in 0:n_var_per_step:(N)*n_var_per_step],
+                [base + n_state + n_ctrl + 1 for base in 0:n_var_per_step:(N)*n_var_per_step])
+
+    # Soc = SOC([], [])
+            
+    # # ------------------------------------------------------
+    # # Blocchi RSOC
+    # # ------------------------------------------------------
+    # Ind_z = [[base+7 for base in 0:n_var_per_step:(N)*n_var_per_step]]
+    # ind_tRSOC = [base+n_state+n_ctrl+2 for base in 0:n_var_per_step:(N)*n_var_per_step]
+
+
+    # Rsoc = RSOC(Ind_z, z0k, ind_tRSOC, [], collect(1/2*ones(N+1)))
+
+
+    # # Rsoc = RSOC([[]], [], [], [], [])
+
+    # # ------------------------------------------------------
+    # # Vincoli di Inequality 
+    # # ------------------------------------------------------
+
+    # rhs_BoxMin_z = Float64[]
+    # rhs_BoxMax_z = Float64[]
+    # Ind_Box_z    = Int[]
+
+    # Ind_NonNeg = Int[]
+    # Ind_InGen = Vector{Vector{Int}}()
+    # Coeff_InGen = Vector{Vector{Float64}}()
+    # rhs_inGen = Float64[]
+
+    # for k in 1:N+1
+    #     base_k = (k-1)*n_var_per_step
+        
+    #     z_index = base_k + 7   # variabile log-massa
+    #     t_index = base_k + n_state + n_ctrl + 1   # variabile t
+    #     t_index_RSOC = base_k + n_state + n_ctrl + 2   # variabile t RSOC
+        
+    #     push!(Ind_NonNeg,t_index_RSOC)
+
+    #     push!(Ind_InGen,[t_index, z_index])
+    #     push!(Coeff_InGen, [1, only(μ2k[k])])
+    #     push!(rhs_inGen, only(μ2k[k])*(1 + only(z0k[k])))  # upper bound dinamico per t_k
+        
+
+    #     push!(Ind_InGen,[t_index, z_index ])
+    #     push!(Coeff_InGen, [-1, only(-μ1k[k])])
+
+    #     # push!(Ind_InGen,[t_index, z_index , t_index_RSOC])
+    #     # push!(Coeff_InGen, [-1, only(-μ1k[k]),  only(1/2*μ1k[k])])
+    #     push!(rhs_inGen, -only(μ1k[k])*(1 + only(z0k[k])))  # lower bound dinamico per t_k
+
+        
+    #     # bounds per z_k
+    #     push!(Ind_InGen, [z_index])
+    #     push!(Coeff_InGen, [-1])
+    #     push!(rhs_inGen, -only(z0k[k]))
+
+    #     # bounds per z_k
+    #     push!(Ind_InGen, [z_index])
+    #     push!(Coeff_InGen, [1])
+    #     push!(rhs_inGen, log(m_wet - alpha*ρ1*(k*dt)))
+    # end
+
+    # Ineq = INEQ(Ind_NonNeg, Ind_Box_z,
+    #               rhs_BoxMin_z,
+    #               rhs_BoxMax_z,
+    #               Ind_InGen , Coeff_InGen, rhs_inGen)
+
+    # # Ineq = INEQ([], [],
+    # #              [],
+    # #              [],
+    # #              [], [],[])
+
+    # ------------------------------------------------------
+    # Cost vector
+    # ------------------------------------------------------
+    obj = zeros(total_vars)
+    obj[ (N-1) *n_var_per_step + 7] = -1
+
+
+
+    # # Definizione problema
+    # prob = SOCP(c, F, g, Soc, Rsoc, Ineq)
+
+    # # # Vincoli lineari Ax <= c
+    # F = []
+    # c = []
+
+
+
+    H = Matrix{Float64}(I, total_vars, total_vars)
+    x0 = zeros(total_vars)
+    cones = []
+
+
+
+    x, z_sol = admm_socp(x0, Soc, obj, H; 
+                   F, g,    # vincoli lineari di uguaglianza
+                   A=nothing, c=nothing, Clamp=0,    # vincoli lineari di disuguaglianza
+                   ρ=1.0, max_iter=200, tol=1e-6)
+
+
+
+    # ------------------------------------------------------
+    # Estrarre traiettoria
+    # ------------------------------------------------------
+    r_traj = [x[(k)*n_var_per_step+1 : (k)*n_var_per_step+3] for k in 0:N]
+    v_traj = [x[(k)*n_var_per_step+4 : (k)*n_var_per_step+6] for k in 0:N]
+    z_traj = [x[(k)*n_var_per_step+7] for k in 0:N]
+    u_traj = [x[(k)*n_var_per_step+8 : (k)*n_var_per_step+10] for k in 0:N]
+    theta_traj = [acosd(x[(k)*n_var_per_step+10] / norm(u_traj[k+1])) for k in 0:N]
+    t_traj = [x[(k)*n_var_per_step+11] for k in 0:N]
+
+    println("Objective (fuel) = ", m_wet - exp.(z_traj[end]))
+
+    # Convertire lista di vettori in matrice N x 3
+    r_mat = hcat(r_traj...)'  # N x 3
+    v_mat = hcat(v_traj...)'  # N x 3
+    u_mat = hcat(u_traj...)'  # N x 3
+    theta_vec = collect(theta_traj) # già N x 1 
+    m_vec = exp.(collect(z_traj))   # già N x 1
+
+    # Plot
+    t = 0 :dt:(N*dt)
+    display(r_mat)
+    display(t)
+
+    p2 = plot(t[1:end],r_mat, xlabel="Time [s]", ylabel="Position x",  legend=false)
+    p3 = plot(t[1:end],v_mat, xlabel="Time [s]", ylabel="veloity v",  legend=false)
+    p4 = plot(t[1:end], m_vec, xlabel="Time [s]", ylabel="Mass m", legend=false)
+
+    p5 = plot(t[1:end], u_mat, xlabel="Time [s]", ylabel="Force u", title="Profilo della forza ottima", legend=false)
+
+
+    display(plot( p2, p3, p4, layout=(3,1), size=(700,1000)))
+    plot( p5, layout=(3,1), size=(700,1000))
+
+
+end
+
+demo()
