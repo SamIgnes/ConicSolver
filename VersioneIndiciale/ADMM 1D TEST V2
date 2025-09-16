@@ -5,7 +5,7 @@ using BenchmarkTools
 using SparseArrays
 
 include("FunctionsProjections")
-include("ADMM Solver")
+include("ADMM Solver V2")
 
 # Parametri
 T = 10.0
@@ -18,7 +18,7 @@ nu = N        # u_k
 
 # Costruzione del problema lineare
 # Variabili concatenano: [x_0..x_N, v_0..v_N, u_0..u_{N-1}]
-n = nx + nu + 1
+n = nx + nu 
 
 # Obiettivo: J = sum(u_k^2)
 obj = zeros(n)
@@ -26,8 +26,8 @@ obj[nx+1:end] .= 0.0  # minimizziamo u_k^2 → implementiamo in ADMM come obj^T 
 
 # Vincoli dinamica Ax = g
 # Matrice di uguaglianza
-# F = zeros(2*N+4, n)
-F = zeros(2*N+5, n)
+F = zeros(2*N+4, n)
+# F = zeros(2*N+5, n)
 
 for k in 1:N
     # x_{k+1} - x_k - dt*v_k = 0
@@ -51,66 +51,45 @@ xI_idx = 1
 vI_idx = N+2
 F[2*N+3, xI_idx] = 1.0   # x_N = 5
 F[2*N+4, vI_idx] = 1.0   # v_N = 0
-F[2*N+5, n] = 1.0   # v_N = 0
 
-g = vcat(zeros(2*N),[5.0, 0.0, 0.0, 0.0, 0.2])  # condizioni iniziali e finali
+# F[2*N+5, n] = 1.0   # v_N = 0
+
+# g = vcat(zeros(2*N),[5.0, 0.0, 0.0, 0.0, 0.0])  # condizioni iniziali e finali
+g = vcat(zeros(2*N),[5.0, 0.0, 0.0, 0.0])  # condizioni iniziali e finali
+# In ADMM potremmo gestire condizioni finali come vincoli aggiuntivi
+# oppure aggiungere penalità quadratica nell'obiettivo
 
 # Punto iniziale
 x0 = zeros(n)
 
 # Nessun cono
-# Soc = SOC([], [], [])
-# Soc = SOC([collect([nx+k]) for k in 1:(nu)],
-# [], 0.2.*ones(nu))
-Soc = SOC([collect([nx+k]) for k in 1:(nu)],
-[n for k in 1:nu], [])
-
-
-Rsoc = RSOC([],[],[],[],[],[])
-# Rsoc = RSOC([ [nx+k] for k in 1:nu ],  # vettori x nel cono
-#     [],
-#     [],
-#     [ 0.2 for k in 1:nu ],           # s_k
-#     [],
-#     [ 0.1 for k in 1:nu ]            # t_k
-# )
+    Soc = SOC([collect([nx+k]) for k in 1:(nu)],
+    [], 0.21.*ones(nu)  )
+    # Soc = SOC([], [], [])
 
 # ADMM
 ρ = 1.0
-max_iter = 100000
-ε_abs = 1e-6
-ε_rel = 1e-6
-tol = 1e-4
+max_iter = 500
+tol = 1e-6
 
-# # Vincoli lineari Ax <= c
-# A = zeros(2*nu,n)
-# idx = nx+1:nx+nu
-# A[1:nu,idx] = I(nu)
-# A[nu+1:2*nu,idx] = -I(nu)
-# c = zeros(2*nu)
-# c[1:nu] .= 0.2 
-# c[nu+1:2*nu] .= 0.2
+Ind_A = [[nx+k] for k in 1:nu]
+append!(Ind_A, [[nx+k] for k in 1:nu])
+Coeff_A = [[1.0]  for k in 1:nu]
+append!(Coeff_A, [1.0] for k in 1:nu)
+rhs = vcat(-0.2.*ones(nu), 0.2*ones(nu))
 
-A = zeros(0, 0)   # matrice 0x0 di Float64
-c=[]
+display(typeof(Coeff_A))
+display(typeof(Ind_A))
+display(typeof(rhs))
 
-
-Ind_Box = nx+1:nx+nu
-
-rhs_BoxMax = 0.2*ones(nu)
-rhs_BoxMin = -0.2*ones(nu)
-
-Ineq = INEQ([],[],[],A,[])
-# Ineq = INEQ(Ind_Box,rhs_BoxMin,rhs_BoxMax, A, c)
-
-
+Ineq = INEQ([],[], [],[],Ind_A, Coeff_A, rhs)
 
 
 H = zeros(n,n)
 H[nx+1:nx+nu, nx+1:nx+nu] = dt*I(N)   # peso integrale u_k^2
 
 
-x_sol, z_sol = admm_socp(x0, Soc, Rsoc, obj, H, F, g, Ineq; ρ=ρ, max_iter=max_iter, ε_abs=ε_abs,  ε_rel = ε_rel, tol=tol)
+@btime x_sol, z_sol = admm_socp(x0, Soc, obj, H, F=F, g=g, Ineq=Ineq, ρ=ρ, max_iter=max_iter, tol=tol)
 
 
 x_vals = x_sol[1:N+1]  # posizioni x_k

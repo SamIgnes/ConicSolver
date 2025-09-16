@@ -6,7 +6,7 @@ using BenchmarkTools
 # Parametri problema
 # =========================
 T = 10.0
-N = 500                    # numero di intervalli (usa N più grande per maggiore precisione)
+N = 50                    # numero di intervalli (usa N più grande per maggiore precisione)
 dt = T / N
 
 # Indici: useremo k = 0..N mappati su 1..N+1 in JuMP
@@ -53,6 +53,10 @@ for k in 1:N
     @constraint(model, [ s[k], 1.0, u[k] ] in RotatedSecondOrderCone())
 end
 
+# for k in 1:N
+#     @constraint(model, [ 0.2, 0.1, u[k] ] in RotatedSecondOrderCone())
+# end
+
 # Opzione: vincolo box su u (se vuoi limitare il controllo e vedere bang-bang)
 if use_u_box
     for k in 1:N
@@ -88,7 +92,7 @@ println("Objective (approx integral u^2): ", objval)
 # Plot
 # =========================
 t = range(0, stop=T, length=N+1)          # tempi per x,v (N+1 punti)
-t_u = range(0, stop=T-dt, length=N)       # tempi per u (N punti)
+t_u = range(dt, stop=T, length=N)       # tempi per u (N punti)
 
 p1 = plot(t_u, u_sol, xlabel="Time [s]", ylabel="u", title="Control (u)", legend=false)
 p2 = plot(t, v_sol, xlabel="Time [s]", ylabel="v", title="Velocity (v)", legend=false)

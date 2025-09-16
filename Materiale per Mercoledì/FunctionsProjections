@@ -2,14 +2,15 @@
 # Proiezione su politopo { z : A z ≤ c } via duale + PGD
 # ================================================
 
-mutable struct INEQ
-    Ind_NonNeg:: Vector{Int}  # Indici delle variabili con vincoli di non negatività
+struct INEQ
+    # Ind_NonNeg:: Vector{Int}  # Indici delle variabili con vincoli di non negatività
     Ind_Box:: Vector{Int}  # Indici delle variabili con vincoli box (min, max)
     rhs_BoxMin:: Vector{Float64}  # Valori t per i vincoli box Min
     rhs_BoxMax:: Vector{Float64}  # Valori t per i vincoli box Max
-    Ind_InGen:: Vector{Vector{Int}}  # Indici delle variabili con vincoli generali 
-    Coeff_InGen:: Vector{Vector{Float64}}  # Coefficienti per i vincoli generali
-    rhs_inGen:: Vector{Float64}  # Valori t per i vincoli generali  
+    # Ind_A:: Vector{Vector{Int}}  # Indici delle variabili con vincoli generali 
+    # Coeff_A:: Vector{Vector{Float64}}  # Coefficienti per i vincoli generali
+    A:: Matrix{Float64}
+    rhs_c:: Vector{Float64}  # Valori t per i vincoli generali  
 end
 
 """
@@ -42,10 +43,14 @@ Each RSOC is defined by:
 
 The RSOC constraint is: `||x||^2 <= 2 * u * v`, with `u >= 0` and `v >= 0`.
 """
+
 struct RSOC
     Ind_x::Vector{Vector{Int}}  # Indices of x variables for each RSOC
+    Shift_x::Vector{Vector{Int}} # Shift of x for each variables of each RSOC
     Ind_u::Vector{Int}          # Indices of u variables
+    Value_u::Vector{Float64}    # 
     Ind_v::Vector{Int}          # Indices of v variables
+    Value_v::Vector{Float64}    # 
 end
 
 
@@ -57,6 +62,40 @@ struct SOCP
     Rsoc :: RSOC # per RSOC
     Ineq :: INEQ         # Inequality constraints 
 end
+
+function proj_polytope_dual(v::Vector, A::Matrix, c::Vector; 
+                             max_iter=500, tol=1e-8)
+
+    m, n = size(A)   # m = numero vincoli, n = numero variabili
+    λ = zeros(m)     # moltiplicatori duali
+    # v è già A*x + uA
+
+    # stima passo ottimale: 1 / L con L = ||A*A'||₂
+    L = opnorm(A * A', 2)
+    α = 1.0 / L
+
+    for k in 1:max_iter
+        # gradiente del duale: ∇f(λ) = A*A' λ - (v - c)
+        grad = (A * (A' * λ)) - (v - c)
+
+        # step di discesa con proiezione
+        λ_new = λ - α * grad
+        λ_new = max.(λ_new, 0.0)
+
+        # controllo convergenza
+        if norm(λ_new - λ) < tol
+            λ = λ_new
+            break
+        end
+        λ = λ_new
+    end
+
+    # ricostruzione soluzione primale nello spazio dei vincoli
+    # zA = v - A*(A'*λ)
+    zA = v - (A * (A' * λ))  # mantiene dimensione m
+    return zA
+end
+
 
 function proj_polytope(v::Vector, A::Matrix, c::Vector; 
                        max_iter=500, tol=1e-8)
@@ -90,52 +129,113 @@ function proj_polytope(v::Vector, A::Matrix, c::Vector;
     return z
 end
 
-function proj_rsoc(v::Vector)
-    n = length(v)
-    z = copy(v)
-    t = norm(v[3:end])
+"""
+    proj_rsoc(u, w, x; fixed_u=false, fixed_w=false)
 
-    # Caso già nel cono
-    if v[1] >= 0 && v[2] >= 0 && v[1]*v[2] >= t^2
-        return v
+Proietta (u,w,x) sul Rotated Second Order Cone:
+
+    K = { (u,w,x) : u >= 0, w >= 0, 2uw >= ||x||^2 }
+
+Opzioni:
+- fixed_u = true → u è fissato, non viene modificato
+- fixed_w = true → w è fissato, non viene modificato
+"""
+function proj_rsoc(u, w, x, fixed_u, fixed_w)
+    t = norm(x)
+
+    #  Caso entrambi fissati → clamp radiale su x
+    if fixed_u && fixed_w
+        r2 = 2*u*w
+        if r2 < 0
+            return u, w, zero(x)
+        elseif t^2 <= r2
+            return u, w, x
+        else
+            return u, w, sqrt(r2) * (x / t)
+        end
     end
 
-    # Caso origine / componenti negative
+    #  Caso u fissato, w variabile
+    if fixed_u && !fixed_w
+        r2 = 2*u*w
+        if r2 < 0
+            return u, max(0.0,w), zero(x)
+        elseif t^2 <= r2 && w >= 0
+            return u, w, x
+        else
+            # Clamp radiale su x e aggiustamento minimo di w
+            x_new = sqrt(max(0.0,2*u*max(w,0))) * (x/t)
+            w_new = max(w, (t^2)/(2*max(u,1e-12)))
+            return u, w_new, x_new
+        end
+    end
+
+    #  Caso w fissato, u variabile
+    if fixed_w && !fixed_u
+        r2 = 2*u*w
+        if r2 < 0
+            return max(0.0,u), w, zero(x)
+        elseif t^2 <= r2 && u >= 0
+            return u, w, x
+        else
+            # Clamp radiale su x e aggiustamento minimo di u
+            x_new = sqrt(max(0.0,2*w*max(u,0))) * (x/t)
+            u_new = max(u, (t^2)/(2*max(w,1e-12)))
+            return u_new, w, x_new
+        end
+    end
+
+    # 🔹 Caso generale: entrambi variabili
+    u1, w1, x1 = copy(u), copy(w), copy(x)
+
+    if u >= 0 && w >= 0 && 2u*w >= t^2
+        return u, w, x
+    end
+
     if t == 0
-        z[1] = max(v[1], 0)
-        z[2] = max(v[2], 0)
-        z[3:end] .= 0
-        return z
+        u1 = max(u, 0)
+        w1 = max(w, 0)
+        x1 .= 0
+        return u1, w1, x1
     end
 
-    # Caso generale
-    s = (v[1] + v[2])
+    # Heuristic projection (come nella tua versione)
+    s = u + w
     if t^2 <= (s^2)/4 && s > 0
         alpha = (s + 2*t)/2
-        z[1] = alpha
-        z[2] = alpha
-        z[3:end] .= alpha / t * v[3:end]
+        u1, w1 = alpha, alpha
+        x1 .= (alpha/t) * x
     else
-        # t^2 > (v1+v2)^2/4
-        z[1] = t
-        z[2] = t
-        # z[3:n] rimane invariato
+        beta = t/sqrt(2)
+        u1, w1 = max(beta,0.0), max(beta,0.0)
+        x1 .= (u1/t) * x
     end
-    return z
+
+    return u1, w1, x1
 end
 
-function proj_soc(u::AbstractVector, t::Real)
-    if length(u) > 1
+
+
+function proj_soc(u::AbstractVector, t::Real, fixed_t::Bool)
+    if !fixed_t
+        # ----- Caso variabile -----
+        nx = norm(u)
+        if nx <= t
+            return copy(u), t
+        elseif nx <= -t
+            return zeros(length(u)), 0.0
+        else
+            α = (nx + t) / (2nx)
+            return α * u, (nx + t) / 2
+        end
+    else
+        # ----- Caso fisso -----
         nx = norm(u)
         if nx <= t
             return copy(u), t
         else
-            alpha = (nx + t) / (2nx)
-            return alpha * u, (nx + t)/2
+            return (t / nx) * u
         end
-    else
-        # caso scalare: cono [-t, t]
-        return clamp.(u, -t, t)
     end
 end
 

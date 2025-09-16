@@ -1,0 +1,271 @@
+include("FunctionsProjections")
+
+# ==============================================================
+# ADMM per SOCP (Second Order Cone Programming) con vincoli:
+#   - Conici
+#   - Lineari di uguaglianza (Fx = g)
+#   - Lineari di disuguaglianza (Ax ≤ c)
+#   - Clamp (limiti su subset di variabili di controllo)
+#
+# Parametri:
+#   x0      : vettore iniziale
+#   Soc     : struttura contenente indici e parametri dei coni
+#   obj     : vettore gradiente del costo (termine lineare nell'obiettivo)
+#   H       : matrice Hessiana dell'obiettivo quadratico
+#
+#   F, g    : vincoli lineari di uguaglianza (Fx = g)
+#   A, c    : vincoli lineari di disuguaglianza (Ax ≤ c)
+#   Clamp   : indici delle variabili soggette a vincoli di clamp
+#
+# Opzioni:
+#   ρ       : parametro di penalità ADMM
+#   max_iter: numero massimo di iterazioni
+#   tol     : tolleranza per la convergenza
+#
+# Output:
+#   x       : soluzione primale
+#   z       : variabili ausiliarie per vincoli conici
+# ==============================================================
+
+function admm_socp(x0, Soc::SOC, obj, H;
+                   F=nothing, g=nothing,       # vincoli lineari di uguaglianza
+                   A=nothing, c=nothing, Clamp, # vincoli lineari di disuguaglianza
+                   ρ=1.0, max_iter=200, tol=1e-6)
+
+    # ------------------------
+    # Dimensioni del problema
+    # ------------------------
+    n  = length(x0)             # dimensione delle variabili
+    m  = length(Soc.Ind_Soc)    # numero di vincoli conici
+    mv = length(Soc.Ind_t_Soc)  # numero di vincoli conici con variabile t
+    nu = length(Clamp)          # numero di variabili con clamp
+    na = length(c)
+
+    # ------------------------
+    # Variabili primali/dual
+    # ------------------------
+    x = copy(x0)
+
+    # Coni
+    z = m > 0 ? zeros(n, m) : zeros(0, 0)
+    u = m > 0 ? zeros(n, m) : zeros(0, 0)
+
+    # Disuguaglianze Ax ≤ c
+    if A !== nothing && na > 0
+        zA = zeros(na)
+        uA = zeros(na)
+    end
+
+    # Clamp
+    if nu > 0
+        zU = zeros(nu)
+        uU = zeros(nu)
+    end
+
+    # ------------------------
+    # Costruzione matrice Hx per l'update di x
+    # ------------------------
+    Hx = copy(H)
+
+    # 1️⃣ Contributo vincoli conici
+    if m > 0
+        for i in 1:m
+            idx_vec = Soc.Ind_Soc[i]
+            Hx[idx_vec, idx_vec] += ρ * I(length(idx_vec))
+        end
+        if mv > 0
+            for i in 1:mv
+                idx_scal = Soc.Ind_t_Soc[i]
+                Hx[idx_scal, idx_scal] += ρ
+            end
+        end
+    else
+        sum_z_u = zeros(n)
+    end
+
+    # if A !== nothing && na > 0
+    #     for i in 1:n
+    #         Hx[i,i] += ρ   # aggiungi ρ solo alle variabili coinvolte in A
+    #     end
+    # end
+
+    # 2️⃣ Contributo vincoli di disuguaglianza Ax ≤ c
+    if A !== nothing && na > 0
+        Hx .+= ρ * (A' * A)
+    end
+
+    # 3️⃣ Contributo vincoli clamp
+    if nu > 0
+        for i in Clamp
+            Hx[i,i] += ρ
+        end
+    end
+
+    # ------------------------
+    # Fattorizzazioni (con o senza vincoli di uguaglianza)
+    # ------------------------
+    if F === nothing && size(F,1) == 0
+        Hx_fact = factorize(Hx)
+    else
+        KKT = [Hx F'; F zeros(size(F,1), size(F,1))]
+        KKT_fact = lu(KKT)
+    end
+
+    # ==========================================================
+    # Iterazioni ADMM
+    # ==========================================================
+    for k in 1:max_iter
+
+        # ------------------------
+        # x-update
+        # ------------------------
+        extra_term = zeros(n)
+
+        # Vincoli di disuguaglianza
+        if A !== nothing && na > 0
+            @views extra_term .+= A'*(zA - uA)
+        end
+
+        # Clamp
+        if nu > 0
+            @views extra_term[n-nu+1:end] .+= zU - uU
+        end
+
+        # Coni
+        if m > 0
+            sum_z_u = zeros(n)
+            for j in 1:m
+                @views sum_z_u .+= z[:,j] .- u[:,j]
+            end
+        end
+
+        # RHS per il sistema lineare
+        f = ρ*sum_z_u + ρ*extra_term - obj
+
+        if F !== nothing && size(F,1) != 0
+            # Risoluzione sistema KKT (con vincoli Fx = g)
+            rhs = vcat(f, g)
+            sol = KKT_fact \ rhs
+            x = sol[1:n]
+        else
+            # Caso senza vincoli di uguaglianza
+            x = Hx_fact \ f
+        end
+
+        if any(isnan, x)
+            error("NaN rilevato in x-update")
+        end
+
+        # ------------------------
+        # z-update (vincoli conici)
+        # ------------------------
+        if m > 0
+            for i in 1:m
+                idx_vec = Soc.Ind_Soc[i]
+                if i <= mv
+                    idx_scal = Soc.Ind_t_Soc[i]
+                    z[idx_vec,i], z[idx_scal,i] =
+                        proj_soc(x[idx_vec] + u[idx_vec,i],
+                                 x[idx_scal] + u[idx_scal,i])
+                else
+                    idx_scal = i - mv
+                    z[idx_vec,i] =
+                        proj_soc(x[idx_vec] + u[idx_vec,i],
+                                 Soc.t_Soc[idx_scal])
+                end
+            end
+        end
+
+        # ------------------------
+        # z-update (vincoli Ax ≤ c)
+        # ------------------------
+        if A !== nothing && na > 0
+            zA = proj_polytope_dual(A*x + uA, A, c)
+        end
+
+        # ------------------------
+        # z-update (Clamp: u_min ≤ u ≤ u_max)
+        # ------------------------
+        if nu > 0
+            @views xU = x[Clamp]
+            zU .= clamp.(xU .+ uU, -0.2, 0.2)
+        end
+
+        # ------------------------
+        # u-update
+        # ------------------------
+        if m > 0
+            for i in 1:m
+                idx_vec = Soc.Ind_Soc[i]
+                u[idx_vec,i] += x[idx_vec] - z[idx_vec,i]
+            end
+        end
+        if A !== nothing && na > 0
+            uA += A*x - zA
+        end
+        if nu > 0
+            uU += xU - zU
+        end
+
+        # ------------------------
+        # Controllo convergenza
+        # ------------------------
+        r_norm = 0.0
+        if m > 0
+            r_norm += sum(norm.(eachcol(x .- z)))
+        end
+        if A !== nothing
+            r_norm += norm(A*x - zA)
+        end
+        if nu > 0
+            r_norm += norm(x[n-nu+1:end] - zU)
+        end
+
+        if r_norm < tol
+            println("Converged at iteration $k")
+            break
+        end
+    end
+
+    # ==========================================================
+    # Check generale di fattibilità
+    # ==========================================================
+    feasible = true
+
+    # Vincoli conici
+    for i in 1:length(Soc.Ind_Soc)
+        if i < mv
+            dist = norm(x[Soc.Ind_Soc[i]]) - x[Soc.Ind_t_Soc[i]]
+            if dist > tol
+                println("⚠️ Violato vincolo conico: distanza = $dist")
+                feasible = false
+            end
+        else
+            dist = norm(x[Soc.Ind_Soc[i]]) - Soc.t_Soc[i]
+            if dist > tol
+                println("⚠️ Violato vincolo conico: distanza = $dist")
+                feasible = false
+            end
+        end
+    end
+
+    # Vincoli lineari di uguaglianza
+    if F !== nothing && size(F,1) != 0
+        residual = norm(F * x - g)
+        if residual > tol
+            println("⚠️ Violati vincoli lineari di uguaglianza: residuo = $residual")
+            feasible = false
+        end
+    end
+
+    # Vincoli di disuguaglianza
+    if A !== nothing
+        viol = A * x - c
+        if any(viol .> tol)
+            println("⚠️ Violati vincoli di disuguaglianza: max violazione = $(maximum(viol))")
+            feasible = false
+        end
+    end
+
+    return x, z
+end

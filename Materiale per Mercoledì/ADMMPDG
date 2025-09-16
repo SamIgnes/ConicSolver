@@ -1,0 +1,252 @@
+using LinearAlgebra
+using Plots
+using TickTock
+using BenchmarkTools
+using SparseArrays
+
+include("FunctionsProjections")
+include("ADMM Solver")
+
+
+function demo()
+
+    # ADMM
+    ρ = 1.0
+    max_iter = 500
+    tol = 1e-6
+
+    # ------------------------------------------------------
+    # Parametri Marte e navetta
+    # ------------------------------------------------------
+    N = 72
+    dt = 1
+    Isp = 225
+    gM  = [0.0, 0.0, -3.711]     # m/s^2 (Marte) come vettore
+    φ = 27*(π/180)  # angolo di inclinazione del motore
+    alpha  = 1/(Isp*9.80665*cos(φ)) # calcola in base ai tuoi parametri
+    T = 6 * 3.1e3
+    ρ1 = 0.3*T
+    ρ2 = 0.8*T
+    m_wet   = 1905.0
+    β     = tand(1)
+    r0 = [2000, 0.0, 1500] # posizione iniziale (m)
+    v0 = [100.0, 0.0, -75.0]      # velocità iniziale (m/s)
+    z0_init = log(m_wet)
+
+    # Precompute z0_k, μ1_k, μ2_k
+    z0k  = [log(m_wet - alpha*ρ2*(k*dt)) for k in 0:N]
+    μ1k  = [ρ1*exp(-z0k[k+1]) for k in 0:N]
+    μ2k  = [ρ2*exp(-z0k[k+1]) for k in 0:N]
+    zmax = [log(m_wet - alpha*ρ1*(k*dt)) for k in 0:N]
+
+
+    n_state = 7   # r(3), v(3), m(1)
+    n_ctrl = 3    # u (3D)
+    n_t = 1       # t SOC per ogni passo
+    n_t_RSOC = 1  # t RSOC per ogni passo
+    n_var_per_step = n_state + n_ctrl + n_t + n_t_RSOC
+
+    total_vars = (N+1) * n_var_per_step 
+
+
+    # ------------------------------------------------------
+    # Costruire F e g such that F*x = g
+    # ------------------------------------------------------
+    F = zeros(7*(N+2)-1, total_vars)  # dimensione placeholder
+    g = zeros(size(F,1))
+    row_idx = 1
+
+    for k in 1 : (N)
+        base_k = (k-1)*n_var_per_step
+        base_k1 = k*n_var_per_step
+
+        # Posizione
+        for i in 1:3
+            F[row_idx, base_k+i] = 1.0
+            F[row_idx, base_k1+i] = -1.0
+            F[row_idx, base_k+3+i] = dt/2
+            F[row_idx, base_k1+3+i] = dt/2
+            F[row_idx, base_k+7+i] =  1/12*dt^2  # linearizzazione con m_k
+            F[row_idx, base_k1+7+i] = -1/12*dt^2  # linearizzazione con m_k
+            g[row_idx] = 0.0
+            row_idx += 1
+        end
+
+        # Velocità
+        for i in 1:3
+            F[row_idx, base_k+3+i] = 1.0
+            F[row_idx, base_k1+3+i] = -1.0
+            F[row_idx, base_k+7+i] = +dt/2   # linearizzazione
+            F[row_idx, base_k1+7+i] = +dt/2   # linearizzazione
+            g[row_idx] =  -dt * gM[i]
+            row_idx += 1    
+        end
+
+        # Massa m_{k+1} = m_k - dt*alpha*t_k
+        F[row_idx, base_k+7] = 1.0
+        F[row_idx, base_k1+7] = -1.0
+        F[row_idx, base_k+n_state+n_ctrl+1] = - dt * alpha/2
+        F[row_idx, base_k1+n_state+n_ctrl+1] = - dt * alpha/2
+        g[row_idx] = 0.0
+        row_idx += 1
+    end
+
+    # Vincoli iniziali r0, v0, m0
+    for i in 1:3
+        F[row_idx, i] = 1.0; g[row_idx] = r0[i]; row_idx += 1
+    end
+    for i in 1:3
+        F[row_idx, 3+i] = 1.0; g[row_idx] = v0[i]; row_idx += 1
+    end
+    F[row_idx,7] = 1.0; g[row_idx] = z0_init; row_idx += 1
+
+    # Vincoli finali rN=0, vN=0
+
+    base_N = (N)*n_var_per_step
+
+    for i in 1:3
+        F[row_idx, base_N + i] = 1.0; g[row_idx] = 0.0; row_idx += 1
+    end
+    for i in 1:3
+        F[row_idx, base_N + 3 + i] = 1.0; g[row_idx] = 0.0; row_idx += 1
+    end
+    # F[row_idx, base_N + 7 ] = 1.0; g[row_idx] = 1505; row_idx += 1
+
+
+    # # ------------------------------------------------------
+    # # Blocchi SOC
+    # # # ------------------------------------------------------
+    Soc = SOC( [collect(base+8:base+10) for base in 0:n_var_per_step:(N)*n_var_per_step],
+                [base + n_state + n_ctrl + 1 for base in 0:n_var_per_step:(N)*n_var_per_step],[])
+
+    # Soc = SOC([], [], [])
+            
+    # # ------------------------------------------------------
+    # # Blocchi RSOC
+    # # ------------------------------------------------------
+    # Ind_z = [[base+7 for base in 0:n_var_per_step:(N)*n_var_per_step]]
+    # ind_tRSOC = [base+n_state+n_ctrl+2 for base in 0:n_var_per_step:(N)*n_var_per_step]
+
+
+    # Rsoc = RSOC(Ind_z, z0k, ind_tRSOC, [], collect(1/2*ones(N+1)))
+
+
+    # # Rsoc = RSOC([[]], [], [], [], [])
+
+    # # ------------------------------------------------------
+    # # Vincoli di Inequality 
+    # # ------------------------------------------------------
+
+    # rhs_BoxMin_z = z0k
+    # rhs_BoxMax_z = [log(m_wet - alpha*ρ1*(k*dt)) for k in 0:N]
+    # Ind_Box_z    = [(k-1)*n_var_per_step + 7 for k in 1:N+1]
+
+    # Ind_NonNeg = Int[]
+    # Ind_InGen = Vector{Vector{Int}}()
+    # Coeff_InGen = Vector{Vector{Float64}}()
+    # rhs_inGen = Float64[]
+
+    # for k in 1:N+1
+    #     base_k = (k-1)*n_var_per_step
+        
+    #     z_index = base_k + 7   # variabile log-massa
+    #     t_index = base_k + n_state + n_ctrl + 1   # variabile t
+    #     t_index_RSOC = base_k + n_state + n_ctrl + 2   # variabile t RSOC
+        
+    #     push!(Ind_NonNeg,t_index_RSOC)
+
+    #     push!(Ind_InGen,[t_index, z_index])
+    #     push!(Coeff_InGen, [1, only(μ2k[k])])
+    #     push!(rhs_inGen, only(μ2k[k])*(1 + only(z0k[k])))  # upper bound dinamico per t_k
+        
+
+    #     push!(Ind_InGen,[t_index, z_index ])
+    #     push!(Coeff_InGen, [-1, only(-μ1k[k])])
+
+    #     # push!(Ind_InGen,[t_index, z_index , t_index_RSOC])
+    #     # push!(Coeff_InGen, [-1, only(-μ1k[k]),  only(1/2*μ1k[k])])
+    #     push!(rhs_inGen, -only(μ1k[k])*(1 + only(z0k[k])))  # lower bound dinamico per t_k
+
+        
+    #     # bounds per z_k
+    #     push!(Ind_InGen, [z_index])
+    #     push!(Coeff_InGen, [-1])
+    #     push!(rhs_inGen, -only(z0k[k]))
+
+    #     # bounds per z_k
+    #     push!(Ind_InGen, [z_index])
+    #     push!(Coeff_InGen, [1])
+    #     push!(rhs_inGen, log(m_wet - alpha*ρ1*(k*dt)))
+    # end
+
+    # Ineq = INEQ(  Ind_Box_z,
+    #               rhs_BoxMin_z,
+    #               rhs_BoxMax_z,
+    #               zeros(0,0) ,[])
+
+    Ineq = INEQ([], [],
+                 [],
+                 zeros(0,0),
+                 [])
+
+    # ------------------------------------------------------
+    # Cost vector
+    # ------------------------------------------------------
+    obj = zeros(total_vars)
+    obj[ (N-1) *n_var_per_step + 7] = -1
+
+
+
+    # # Definizione problema
+    # prob = SOCP(c, F, g, Soc, Rsoc, Ineq)
+
+    # # # Vincoli lineari Ax <= c
+    # F = []
+    # c = []
+
+
+
+    H = Matrix{Float64}(I, total_vars, total_vars)
+    # H = zeros(total_vars,total_vars)
+    x0 = zeros(total_vars)
+
+    x, z_sol = admm_socp(x0, Soc, Rsoc, obj, H, F, g, Ineq; ρ=ρ, max_iter=max_iter, ε_abs=ε_abs,  ε_rel = ε_rel, tol=tol)
+
+
+
+    # ------------------------------------------------------
+    # Estrarre traiettoria
+    # ------------------------------------------------------
+    r_traj = [x[(k)*n_var_per_step+1 : (k)*n_var_per_step+3] for k in 0:N]
+    v_traj = [x[(k)*n_var_per_step+4 : (k)*n_var_per_step+6] for k in 0:N]
+    z_traj = [x[(k)*n_var_per_step+7] for k in 0:N]
+    u_traj = [x[(k)*n_var_per_step+8 : (k)*n_var_per_step+10] for k in 0:N]
+    theta_traj = [acosd(x[(k)*n_var_per_step+10] / norm(u_traj[k+1])) for k in 0:N]
+    t_traj = [x[(k)*n_var_per_step+11] for k in 0:N]
+
+    println("Objective (fuel) = ", m_wet - exp.(z_traj[end]))
+
+    # Convertire lista di vettori in matrice N x 3
+    r_mat = hcat(r_traj...)'  # N x 3
+    v_mat = hcat(v_traj...)'  # N x 3
+    u_mat = hcat(u_traj...)'  # N x 3
+    theta_vec = collect(theta_traj) # già N x 1 
+    m_vec = exp.(collect(z_traj))   # già N x 1
+
+    # Plot
+    t = 0 :dt:(N*dt)
+
+    p2 = plot(t[1:end],r_mat, xlabel="Time [s]", ylabel="Position x",  legend=false)
+    p3 = plot(t[1:end],v_mat, xlabel="Time [s]", ylabel="veloity v",  legend=false)
+    p4 = plot(t[1:end], m_vec, xlabel="Time [s]", ylabel="Mass m", legend=false)
+
+    p5 = plot(t[1:end], u_mat, xlabel="Time [s]", ylabel="Force u", title="Profilo della forza ottima", legend=false)
+
+
+    display(plot( p2, p3, p4, layout=(3,1), size=(700,1000)))
+    plot(p5)
+
+
+end
+
+demo()
