@@ -32,11 +32,11 @@ set_silent(model)
 
 # Variabili
 @variable(model, u[0:N,1:3])
-@variable(model, σ[0:N] >= 0)
+@variable(model, σ[0:N] >= 0) #Non servono >=
 @variable(model, r[0:N,1:3])
 @variable(model, v[0:N,1:3])
 @variable(model, z[0:N])
-@variable(model, tquad[0:N] >= 0)  # per (z - z0k)^2
+@variable(model, tquad[0:N] >= 0)  # per (z - z0k)^2 #Non servono >=
 
 # Dinamica
 for k in 0:N-1
@@ -59,7 +59,7 @@ for k in 0:N
     @constraint(model, [tquad[k], 0.5, z[k]-z0k[k+1]] in RotatedSecondOrderCone())
 end
 
-# Vincoli su σ_k (inferiore e superiore)
+# # Vincoli su σ_k (inferiore e superiore)
 for k in 0:N
     @constraint(model, μ1k[k+1]*(1 - (z[k]-z0k[k+1]) + 0.5*tquad[k]) <= σ[k])
     @constraint(model, σ[k] <= μ2k[k+1]*(1 - (z[k]-z0k[k+1])))
@@ -93,7 +93,7 @@ end
 
 tock()
 
-@btime optimize!(model)
+optimize!(model)
 
 
 

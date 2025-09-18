@@ -12,8 +12,11 @@ function demo()
 
     # ADMM
     ρ = 1.0
-    max_iter = 500
-    tol = 1e-6
+    max_iter = 10000
+    ε_abs = 1e-4
+    ε_rel = 1e-4
+    tol = 1e-2
+
 
     # ------------------------------------------------------
     # Parametri Marte e navetta
@@ -124,22 +127,21 @@ function demo()
     # # ------------------------------------------------------
     # # Blocchi RSOC
     # # ------------------------------------------------------
-    # Ind_z = [[base+7 for base in 0:n_var_per_step:(N)*n_var_per_step]]
-    # ind_tRSOC = [base+n_state+n_ctrl+2 for base in 0:n_var_per_step:(N)*n_var_per_step]
+    Ind_z = [[base+7] for base in 0:n_var_per_step:(N)*n_var_per_step]
+    ind_tRSOC = [base+n_state+n_ctrl+2 for base in 0:n_var_per_step:(N)*n_var_per_step]
 
 
-    # Rsoc = RSOC(Ind_z, z0k, ind_tRSOC, [], collect(1/2*ones(N+1)))
+    # Rsoc = RSOC(Ind_z, [[log(m_wet - alpha*ρ2*(k*dt))] for k in 0:N], [], 0.5*ones(N+1), ind_tRSOC, [])
 
-
-    # # Rsoc = RSOC([[]], [], [], [], [])
+    Rsoc = RSOC([],[], [], [], [],[])
 
     # # ------------------------------------------------------
     # # Vincoli di Inequality 
     # # ------------------------------------------------------
 
-    # rhs_BoxMin_z = z0k
-    # rhs_BoxMax_z = [log(m_wet - alpha*ρ1*(k*dt)) for k in 0:N]
-    # Ind_Box_z    = [(k-1)*n_var_per_step + 7 for k in 1:N+1]
+    rhs_BoxMin_z = z0k
+    rhs_BoxMax_z = zmax
+    Ind_Box_z    = [(k-1)*n_var_per_step + 7 for k in 1:N+1]
 
     # Ind_NonNeg = Int[]
     # Ind_InGen = Vector{Vector{Int}}()
@@ -179,39 +181,73 @@ function demo()
     #     push!(rhs_inGen, log(m_wet - alpha*ρ1*(k*dt)))
     # end
 
-    # Ineq = INEQ(  Ind_Box_z,
-    #               rhs_BoxMin_z,
-    #               rhs_BoxMax_z,
-    #               zeros(0,0) ,[])
 
-    Ineq = INEQ([], [],
-                 [],
-                 zeros(0,0),
-                 [])
+
+    n_var_tot = (N+1)*n_var_per_step
+    n_constr_per_step = 4
+    n_constr_tot = n_constr_per_step*(N+1)
+
+    A = zeros(n_constr_tot, n_var_tot)
+    c = zeros(n_constr_tot)
+
+    row = 1
+    for k in 1:N+1
+        base_k = (k-1)*n_var_per_step
+        z_index = base_k + 7
+        t_index = base_k + n_state + n_ctrl + 1
+        t_index_RSOC = base_k + n_state + n_ctrl + 2
+
+        # 1) upper bound dinamico per t_k:  t + μ2k*z ≤ μ2k*(1+z0k)
+        A[row, t_index] = 1
+        A[row, z_index] = only(μ2k[k])
+        c[row] = only(μ2k[k])*(1 + only(z0k[k]))
+        row += 1
+
+        # 2) lower bound dinamico per t_k: -t + μ1k*z ≤ -μ1k*(1+z0k)
+        A[row, t_index] = -1
+        A[row, z_index] = only(-μ1k[k])
+        # A[row, t_index_RSOC] = 1/2
+        c[row] = -only(μ1k[k])*(1 + only(z0k[k]))
+        row += 1
+
+        # 3) bound inferiore su z_k: -z ≤ -z0k
+        A[row, z_index] = -1
+        c[row] = -only(z0k[k])
+        row += 1
+
+        # 4) bound superiore su z_k: z ≤ log(m_wet - alpha*ρ1*(k*dt))
+        A[row, z_index] = 1
+        c[row] = log(m_wet - alpha*ρ1*(k*dt))
+        row += 1
+    end
+
+
+    Ineq = INEQ([], Ind_Box_z,
+                  rhs_BoxMin_z,
+                  rhs_BoxMax_z,
+                  A ,c)
+
+    # Ineq = INEQ( [],[],[], A ,c)
+
+    # Ineq = INEQ([], [],
+    #              [],
+    #              zeros(0,0),
+    #              [])
 
     # ------------------------------------------------------
     # Cost vector
     # ------------------------------------------------------
     obj = zeros(total_vars)
-    obj[ (N-1) *n_var_per_step + 7] = -1
-
-
+    obj[ (N) *n_var_per_step + 7] = -1
 
     # # Definizione problema
     # prob = SOCP(c, F, g, Soc, Rsoc, Ineq)
 
-    # # # Vincoli lineari Ax <= c
-    # F = []
-    # c = []
-
-
-
-    H = Matrix{Float64}(I, total_vars, total_vars)
+    H = 1.0.*Matrix{Float64}(I, total_vars, total_vars)
     # H = zeros(total_vars,total_vars)
     x0 = zeros(total_vars)
 
     x, z_sol = admm_socp(x0, Soc, Rsoc, obj, H, F, g, Ineq; ρ=ρ, max_iter=max_iter, ε_abs=ε_abs,  ε_rel = ε_rel, tol=tol)
-
 
 
     # ------------------------------------------------------
@@ -240,11 +276,12 @@ function demo()
     p3 = plot(t[1:end],v_mat, xlabel="Time [s]", ylabel="veloity v",  legend=false)
     p4 = plot(t[1:end], m_vec, xlabel="Time [s]", ylabel="Mass m", legend=false)
 
-    p5 = plot(t[1:end], u_mat, xlabel="Time [s]", ylabel="Force u", title="Profilo della forza ottima", legend=false)
-
+    p5 = plot(t[1:end], u_mat, xlabel="Time [s]", ylabel="Force u", title="Profilo della u ottima", label=["ux" "uy" "uz"])
+    p6 = plot(t[1:end], norm.(eachrow(m_vec .* u_mat))./T, xlabel="Time [s]", ylabel="Force u", title="T/Ttot", legend=false)
+    p7 = plot(t[1:end], hcat(norm.(eachrow(u_mat)),t_traj), xlabel="Time [s]", ylabel="Convex ", label=["norm u" "t"])
 
     display(plot( p2, p3, p4, layout=(3,1), size=(700,1000)))
-    plot(p5)
+    plot(p5,p6,p7, layout=(3,1), size=(700,1000))
 
 
 end

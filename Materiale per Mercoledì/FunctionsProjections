@@ -3,7 +3,7 @@
 # ================================================
 
 struct INEQ
-    # Ind_NonNeg:: Vector{Int}  # Indici delle variabili con vincoli di non negatività
+    Ind_NonNeg:: Vector{Int}  # Indici delle variabili con vincoli di non negatività
     Ind_Box:: Vector{Int}  # Indici delle variabili con vincoli box (min, max)
     rhs_BoxMin:: Vector{Float64}  # Valori t per i vincoli box Min
     rhs_BoxMax:: Vector{Float64}  # Valori t per i vincoli box Max
@@ -46,7 +46,7 @@ The RSOC constraint is: `||x||^2 <= 2 * u * v`, with `u >= 0` and `v >= 0`.
 
 struct RSOC
     Ind_x::Vector{Vector{Int}}  # Indices of x variables for each RSOC
-    Shift_x::Vector{Vector{Int}} # Shift of x for each variables of each RSOC
+    Shift_x::Vector{Vector{Float64}} # Shift of x for each variables of each RSOC
     Ind_u::Vector{Int}          # Indices of u variables
     Value_u::Vector{Float64}    # 
     Ind_v::Vector{Int}          # Indices of v variables
@@ -234,7 +234,7 @@ function proj_soc(u::AbstractVector, t::Real, fixed_t::Bool)
         if nx <= t
             return copy(u), t
         else
-            return (t / nx) * u
+            return (t / nx) * u, t
         end
     end
 end

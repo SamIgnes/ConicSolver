@@ -1,0 +1,77 @@
+using JuMP, SCS, LinearAlgebra
+
+function successive_convexification(N, max_iter)
+    # Parametri fisici
+    Isp = 225
+    g  = [0.0, 0.0, -3.711]
+    φ  = 27*(π/180)
+    α  = 1/(Isp*9.80665*cos(φ))
+    T  = 6 * 3.1e3
+    ρ1, ρ2 = 0.3*T, 0.8*T
+    m_wet = 1905.0
+    r0, v0 = [2000,0,1500], [100,0,-75]
+    z0_init = log(m_wet)
+
+    # Parametri drag
+    ρatm, Cd, A = 0.015, 1.5, 10.0
+
+    # Guess iniziale
+    tf = 60.0
+    Δt = tf/N
+    r_nom = [r0 for k=1:N+1]
+    v_nom = [v0 for k=1:N+1]
+    z_nom = [z0_init for k=1:N+1]
+
+    for iter in 1:max_iter
+        model = Model(SCS.Optimizer)
+        set_silent(model)
+
+        # Variabili
+        @variable(model, r[1:N+1,1:3])
+        @variable(model, v[1:N+1,1:3])
+        @variable(model, z[1:N+1])
+        @variable(model, u[1:N+1,1:3])
+        @variable(model, σ[1:N+1] >= 0)
+        @variable(model, tf >= 0)
+
+        Δt = tf/N
+
+        # Dinamica linearizzata
+        for k in 1:N
+            # Drag nominale e Jacobiano
+            vk = v_nom[k]
+            mk = exp(z_nom[k])
+            vnorm = norm(vk) + 1e-6
+            d_nom = -0.5*ρatm*Cd*A*vnorm/mk * vk
+            Jd = -0.5*ρatm*Cd*A/mk * ( (vnorm*I(3)) + (vk*vk')/vnorm )
+
+            # Constraints
+            @constraint(model, r[k+1,:] .== r[k,:] + Δt*v[k,:])
+            @constraint(model, v[k+1,:] .== v[k,:] + Δt*(u[k,:] + g + d_nom + Jd*(v[k,:]-vk)))
+            @constraint(model, z[k+1]   == z[k] - α*Δt*σ[k])
+            @constraint(model, [σ[k]; u[k,1]; u[k,2]; u[k,3]] in SecondOrderCone())
+        end
+
+        # Condizioni iniziali/finali
+        @constraint(model, r[1,:] .== r0)
+        @constraint(model, v[1,:] .== v0)
+        @constraint(model, z[1]   == z0_init)
+        @constraint(model, r[end,:] .== [0,0,0])
+        @constraint(model, v[end,:] .== [0,0,0])
+
+        # Costo
+        @objective(model, Min, -z[end])
+
+        optimize!(model)
+
+        # Aggiorna traiettoria nominale
+        r_nom = [value.(r[k,:]) for k=1:N+1]
+        v_nom = [value.(v[k,:]) for k=1:N+1]
+        z_nom = [value(z[k]) for k=1:N+1]
+        tf = value(tf)
+
+        println("Iter $iter: tf = $tf, m_final = ", exp(z_nom[end]))
+    end
+end
+
+successive_convexification(72, 10)

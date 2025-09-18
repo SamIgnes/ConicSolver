@@ -59,21 +59,21 @@ g = vcat(zeros(2*N),[5.0, 0.0, 0.0, 0.0, 0.2])  # condizioni iniziali e finali
 x0 = zeros(n)
 
 # Nessun cono
-# Soc = SOC([], [], [])
+Soc = SOC([], [], [])
 # Soc = SOC([collect([nx+k]) for k in 1:(nu)],
 # [], 0.2.*ones(nu))
-Soc = SOC([collect([nx+k]) for k in 1:(nu)],
-[n for k in 1:nu], [])
+# Soc = SOC([collect([nx+k]) for k in 1:(nu)],
+# [n for k in 1:nu], [])
 
 
-Rsoc = RSOC([],[],[],[],[],[])
-# Rsoc = RSOC([ [nx+k] for k in 1:nu ],  # vettori x nel cono
-#     [],
-#     [],
-#     [ 0.2 for k in 1:nu ],           # s_k
-#     [],
-#     [ 0.1 for k in 1:nu ]            # t_k
-# )
+# Rsoc = RSOC([],[],[],[],[],[])      
+Rsoc = RSOC([ [nx+k] for k in 1:nu ],  # vettori x nel cono
+    [[0.0] for k in 1:nu],
+    [],
+    [ 0.1 for k in 1:nu ],
+    [n for k in 1:nu],           
+    []    
+)
 
 # ADMM
 ρ = 1.0

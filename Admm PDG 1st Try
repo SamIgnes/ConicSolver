@@ -1,0 +1,370 @@
+###############################################################################
+# SOCP via ADMM – pure‑Julia implementation
+#
+#   min   cᵀ x
+#   s.t.  A x = b
+#         x ∈ K = Q₁ × Q₂ × … × Q_m            (product of second‑order cones)
+#
+# Each second‑order cone Q_k has size n_k and is understood as
+#   Q_k = { (t, y) ∈ ℝ × ℝ^{n_k−1} : ‖y‖₂ ≤ t }.
+#
+# ADMM splitting:
+#   min   cᵀ x + 𝟙_{A x = b}(x) + 𝟙_K(z)
+#         s.t. x − z = 0
+#
+#   x‑update: quadratic + linear constraint (solved by one KKT factorisation)
+#   z‑update: projection onto K   (cheap, closed‑form for SOCs)
+#   u‑update: scaled dual variable
+###############################################################################
+
+
+# ------------------------------------------------------------------------------
+# Projection onto a single second‑order cone
+# ------------------------------------------------------------------------------
+using LinearAlgebra
+using SparseArrays
+using Plots
+
+
+function block_matrix(A, B, N)
+    m, n = size(B)           # dimensione del blocco
+    M = zeros(eltype(A), m*N, n*N)  # matrice finale
+
+    for i in 1:N
+        for j in 1:i
+            M[(m*(i-1)+1):(m*i), (n*(j-1)+1):(n*j)] .= A^(i-j) * B
+        end
+    end
+
+    return M
+end
+
+function proj_lorentz(x::AbstractVector, t::Real)
+    nx = norm(x)
+
+    if nx <= t
+        # già dentro il cono
+        return copy(x), t
+    elseif nx <= -t
+        # proiezione all'origine
+        return zeros(length(x)), 0.0
+    else
+        # proiezione sul bordo del cono
+        alpha = (nx + t) / (2nx)
+        return alpha * x, (nx + t) / 2
+    end
+end
+
+
+function proj_socp(v, cone_idx, nonneg_idx, box_idx, Tmin, Tmax)
+    z = copy(v)
+
+    # Proiezione su ogni cono SOC
+    for idx in cone_idx
+        x = v[idx[1:end-1]]
+        t = v[idx[end]]
+        xproj, tproj = proj_lorentz(x, t)
+        z[idx] = vcat(xproj, tproj)
+    end
+
+    # Proiezione su vincoli di non negatività
+    for idx in nonneg_idx
+        z[idx] = max.(z[idx], 0.0)
+    end
+
+    # Proiezione su box [Tmin, Tmax]
+    for idx in box_idx
+        z[idx] = clamp(z[idx], Tmin, Tmax)
+    end
+
+    return z
+end
+
+# ------------------------------------------------------------------------------
+# ADMM solver
+# ------------------------------------------------------------------------------
+
+struct params
+    Tmin::Float64
+    Tmax::Float64
+end
+
+struct SOCP
+    c::Vector{Float64}
+    A::Matrix{Float64}
+    b::Vector{Float64}
+    cone_idx::Vector{Vector{Int}}    # per SOC
+    nonneg_idx::Vector{Int}          # per slack >= 0
+    box_idx::Vector{Int}             # per box constraints
+    params::params        # parametri del problema
+end
+
+
+
+function admm_socp(prob::SOCP; ρ=1.0, max_iter=10000,
+                   rtol=1e-4, atol=1e-4, verbose=true)
+    """
+     admm_socp(prob::SOCP; ρ = 1.0, max_iter = 10_000,
+       rtol = 1e-4, atol = 1e-4, verbose = true)
+        Solves `prob` with ADMM and returns `(x, history)`.
+        `history` is a Dict with primal/dual residual norms for plotting / inspection.
+    """
+
+
+    # unpack problem
+    c, A, b, cone_idx, nonneg_idx, box_idx, params  = prob.c, prob.A, prob.b, prob.cone_idx, prob.nonneg_idx, prob.box_idx,prob.params
+    n = length(c)
+    m = size(A, 1)
+
+    # precompute KKT factorisation for the x‑subproblem
+    K = [ρ*I(n)  A';  A  zeros(m, m)]
+    F = lu(K)      # factor once
+
+    # initialise variables
+    x = zeros(n);  z = copy(x);  u = zeros(n)
+
+    # iteration history
+    hist = Dict(:r_norm=>Float64[], :s_norm=>Float64[])
+
+    for k in 1:max_iter
+        # ----- 1. x‑update (quadratic + equality) -----------------------------
+        rhs = vcat(ρ*(z - u) - c, b)
+        sol = F \ rhs
+        x   = sol[1:n]
+
+        # ----- 2. z‑update (projection onto K) -------------------------------
+        v = x + u
+        z_old = copy(z) 
+        z = proj_socp(v, cone_idx, nonneg_idx, box_idx, params.Tmin, params.Tmax)
+
+        # ----- 3. dual update -----------------------------------------------
+        u += x - z
+
+        # ----- diagnostics ---------------------------------------------------
+        r_norm = norm(x - z)                  # primal residual
+        s_norm = ρ * norm(z - z_old)      # dual residual (simplifies)
+        push!(hist[:r_norm], r_norm)
+        push!(hist[:s_norm], s_norm)
+
+        eps_pri = sqrt(n)*atol + rtol*max(norm(x), norm(z))
+        eps_du  = sqrt(n)*atol + rtol*norm(ρ*u)
+
+
+        if verbose && k % 100 == 0
+            @info "iter $k  r = $(round(r_norm, sigdigits=3))  " *
+                  "s = $(round(s_norm, sigdigits=3))"
+        end
+        if r_norm ≤ eps_pri && s_norm ≤ eps_du
+            verbose && @info "Converged in $k iterations"
+            return x, hist
+        end
+    end
+    @warn "ADMM reached max_iter = $max_iter without convergence"
+    return x, hist
+end
+
+
+
+# ------------------------------------------------------------------------------
+# Demonstration
+#   min   t
+#   s.t.  x₁ + x₂ = 1
+#         (t, x) ∈ Q  (Q is the 3‑dimensional SOC)
+# Expected optimum: x = (0.5, 0.5), t = √0.5 ≈ 0.7071
+# ------------------------------------------------------------------------------
+function demo()
+
+# ------------------------------------------------------
+# Parametri Marte e navetta
+# ------------------------------------------------------
+N = 72                    # passi discreti
+dt = 1                  # intervallo temporale (s)
+g = [-3.7114, 0.0, 0.0]     # accelerazione gravitazionale Marte (m/s^2)
+m0 = 1905.0               # massa iniziale (kg)
+r0 = [1500, 0.0, 2000] # posizione iniziale (m)
+v0 = [-75.0, 0.0, 100.0]      # velocità iniziale (m/s)
+m_min = 1555.0              # massa minima (kg)
+
+g_e = 9.807
+I_sp = 225
+phi = 27
+T = 6*3.1e3
+
+
+alpha = 1 / (I_sp * g_e * cosd(phi)) 
+
+n_state = 7   # r(3), v(3), m(1)
+n_ctrl = 3    # u (3D)
+n_t = 1       # t SOC per ogni passo
+n_var_per_step = n_state + n_ctrl + n_t
+
+total_vars = N * n_var_per_step
+
+# ------------------------------------------------------
+# Cost vector
+# ------------------------------------------------------
+c = zeros(total_vars)
+for k in 1:N
+    idx_t = (k-1)*n_var_per_step + n_state + n_ctrl + 1
+    c[idx_t] = -alpha*dt
+end
+
+# ------------------------------------------------------
+# Funzione per costruire A e b con massa aggiornata
+# ------------------------------------------------------
+function build_A_b(m_linear)
+    A = zeros(7*(N+1), total_vars)  # dimensione placeholder
+    b = zeros(size(A,1))
+    row_idx = 1
+
+    for k in 1:(N-1)
+        base_k = (k-1)*n_var_per_step
+        base_k1 = k*n_var_per_step
+
+        # Posizione
+        for i in 1:3
+            A[row_idx, base_k1+i] = 1.0
+            A[row_idx, base_k+i] = -1.0
+            A[row_idx, base_k+3+i] = -dt
+            A[row_idx, base_k+7+i] = -0.5*dt^2 / m_linear[k]  # linearizzazione con m_k
+            b[row_idx] = -0.5*dt^2 * g[i]
+            row_idx += 1
+        end
+
+        # Velocità
+        for i in 1:3
+            A[row_idx, base_k1+3+i] = 1.0
+            A[row_idx, base_k+3+i] = -1.0
+            A[row_idx, base_k+7+i] = -dt / m_linear[k]   # linearizzazione
+            b[row_idx] = -dt * g[i]
+            row_idx += 1
+        end
+
+        # Massa m_{k+1} = m_k - dt*alpha*t_k
+        A[row_idx, base_k1+7] = 1.0
+        A[row_idx, base_k+7] = -1.0
+        A[row_idx, base_k+n_state+n_ctrl+1] = dt*alpha
+        b[row_idx] = 0.0
+        row_idx += 1
+    end
+
+    # Vincoli iniziali r0, v0, m0
+    for i in 1:3
+        A[row_idx, i] = 1.0; b[row_idx] = r0[i]; row_idx += 1
+    end
+    for i in 1:3
+        A[row_idx, 3+i] = 1.0; b[row_idx] = v0[i]; row_idx += 1
+    end
+    A[row_idx,7] = 1.0; b[row_idx] = m0; row_idx += 1
+
+    # Vincoli finali rN=0, vN=0, mN>=m_min
+    base_N = (N-1)*n_var_per_step
+    for i in 1:3
+        A[row_idx, base_N + i] = 1.0; b[row_idx] = 0.0; row_idx += 1
+    end
+    for i in 1:3
+        A[row_idx, base_N + 3 + i] = 1.0; b[row_idx] = 0.0; row_idx += 1
+    end
+    A[row_idx, base_N+7] = 1.0; b[row_idx] = m_min; row_idx += 1
+
+    return A, b
+end
+
+# ------------------------------------------------------
+# Blocchi SOC
+# ------------------------------------------------------
+cone_idx = []
+for k in 1:N
+    base = (k-1)*n_var_per_step
+    u_indices = base+8:base+10
+    t_index = base+11
+    push!(cone_idx, vcat(u_indices, t_index))
+end
+nonneg_idx = [base+11 for base in 0:n_var_per_step:(N-1)*n_var_per_step]
+
+# ------------------------------------------------------
+# Iterative convexification
+# ------------------------------------------------------
+m_linear = fill(m0, N)  # inizializzazione
+
+box_idx = [ (k-1)*n_var_per_step + n_state + n_ctrl + 1 for k in 1:N ]
+
+max_outer_iter = 100
+x_prev = zeros(total_vars)
+
+for iter = 1:max_outer_iter
+    # Ricostruisci A e b con massa lineare aggiornata
+    A, b = build_A_b(m_linear)
+
+    # Definizione problema
+    prob = SOCP(c, A, b, cone_idx, nonneg_idx,box_idx, params(0.3*T, 0.8*T))
+
+    # Risoluzione con ADMM
+    x, hist = admm_socp(prob; ρ=10.0, max_iter=5000, rtol=1e-2, atol=1e-2, verbose=false)
+
+    # Aggiorna massa lineare per la prossima iterazione
+    # m_linear = fill(m0, N)
+    m_linear = [x[(k-1)*n_var_per_step+7] for k in 1:N]
+
+    # Convergenza semplice
+    display(norm(x - x_prev))
+    if norm(x - x_prev) < 1e-5
+        println("Converged after $iter convexification iterations")
+        break
+    end
+    x_prev = copy(x)
+end
+
+# ------------------------------------------------------
+# Estrarre traiettoria
+# ------------------------------------------------------
+r_traj = [x_prev[(k-1)*n_var_per_step+1 : (k-1)*n_var_per_step+3] for k in 1:N]
+v_traj = [x_prev[(k-1)*n_var_per_step+4 : (k-1)*n_var_per_step+6] for k in 1:N]
+m_traj = [x_prev[(k-1)*n_var_per_step+7] for k in 1:N]
+u_traj = [x_prev[(k-1)*n_var_per_step+8 : (k-1)*n_var_per_step+10] for k in 1:N]
+theta_traj = [acosd(x_prev[(k-1)*n_var_per_step+8] / norm(u_traj[k])) for k in 1:N]
+t_traj = [x_prev[(k-1)*n_var_per_step+11] for k in 1:N]
+
+
+println("Objective (fuel) = ", sum(t_traj.*alpha.*dt))
+# println("r_traj = ", r_traj)
+# println("v_traj = ", v_traj)
+# println("m_traj = ", m_traj)
+
+# Convertire lista di vettori in matrice N x 3
+r_mat = hcat(r_traj...)'  # N x 3
+v_mat = hcat(v_traj...)'  # N x 3
+u_mat = hcat(u_traj...)'  # N x 3
+theta_vec = collect(theta_traj) # già N x 1 
+m_vec = collect(m_traj)   # già N x 1
+
+# Posizione
+display(plot(r_mat, label=["x" "y" "z"], title="Position Trajectory",
+     xlabel="Time step", ylabel="Position (m)"))
+
+display(plot(v_mat, label=["vx" "vy" "vz"], title="Velocity Trajectory",
+     xlabel="Time step", ylabel="Velocity (m/s)"))
+
+display(plot(m_vec, label="Mass", title="Mass Trajectory",
+     xlabel="Time step", ylabel="Mass (kg)"))
+
+display(plot(t_traj./T, label="Thrust Magnitude", title="Thrust Magnitude Trajectory",
+xlabel="Time step", ylabel="Thrust Magnitude (N)"))
+
+display(plot(u_mat, label=["ux" "uy" "uz"], title="Control U " ,
+     xlabel="Time step", ylabel="Acceleration (m/s)"))
+
+t_vec = [ x_prev[(k-1)*n_var_per_step + n_state + n_ctrl + 1] for k in 1:N ]
+u_norm = [ norm(x_prev[(k-1)*n_var_per_step + 8 : (k-1)*n_var_per_step + 10]) for k in 1:N ]
+
+display(plot(t_vec, label="t", title="t plot",
+xlabel="Time step", ylabel="Thrust Magnitude (N)"))
+
+display(plot(theta_vec, label="Thrust dorection", title="Thrust direction angle",
+xlabel="Time step", ylabel="Thrust direction (degrees)"))
+
+display(plot(u_norm, label="||u||", title="Thrust Magnitude from Control",
+xlabel="Time step", ylabel="Thrust Magnitude (N)"))
+end
+
+demo()
